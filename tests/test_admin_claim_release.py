@@ -33,6 +33,7 @@ class _FakeEntry:
     model_id: str
     engine: Any = object()  # Truthy by default; tests flip to None on unload.
     claims: set[str] = field(default_factory=set)
+    is_loading: bool = False
 
 
 class FakeEnginePool:
@@ -43,18 +44,33 @@ class FakeEnginePool:
             mid: _FakeEntry(model_id=mid) for mid in model_ids
         }
         self._lock = asyncio.Lock()
-        self.unload_calls: list[str] = []
+        self.unload_calls: list[tuple[str, bool]] = []
 
     # --- Same API shape the production pool exposes --------------------
 
     def get_entry(self, model_id: str) -> _FakeEntry | None:
         return self._entries.get(model_id)
 
-    async def _unload_engine(self, model_id: str) -> None:
+    async def _unload_engine(self, model_id: str, force: bool = False) -> None:
         entry = self._entries.get(model_id)
         if entry is not None:
+            # Mirror production semantics: skip when claimed unless forced.
+            if entry.claims and not force:
+                return
             entry.engine = None
-        self.unload_calls.append(model_id)
+            if force:
+                entry.claims.clear()
+        self.unload_calls.append((model_id, force))
+
+    async def request_unload(
+        self,
+        model_id: str,
+        *,
+        force: bool = True,
+        reason: str = "manual unload",
+    ) -> bool:
+        await self._unload_engine(model_id, force=force)
+        return True
 
     async def claim(self, model_id: str, owner: str) -> list[str]:
         async with self._lock:
