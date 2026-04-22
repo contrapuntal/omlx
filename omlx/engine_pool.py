@@ -1115,6 +1115,13 @@ class EnginePool:
                 raise ModelNotFoundError(model_id, list(self._entries.keys()))
             entry.claims.discard(owner)
             remaining = sorted(entry.claims)
+            if not remaining:
+                # Last claim dropped. Clear any persisted pin/ttl that a
+                # prior owner (e.g. LocalAI's LoadModel) set via
+                # update_settings. Otherwise the model preloads on next
+                # oMLX startup and resurrects ownership state the
+                # orchestrator no longer expects (I-5).
+                self._clear_persisted_pin_on_release(model_id)
             if not remaining and entry.engine is not None:
                 # Unload under the lock matches existing convention (see ~361, ~876, ~939);
                 # _unload_engine can take seconds (MLX sync + settle barrier). If this ever
@@ -1123,6 +1130,42 @@ class EnginePool:
                 await self._unload_engine(model_id)
                 return remaining, True
             return remaining, False
+
+    def _clear_persisted_pin_on_release(self, model_id: str) -> None:
+        """Clear persisted pin + ttl when the last claim on *model_id* drops.
+
+        Best-effort: silently no-ops if no settings manager is attached or
+        if no persisted settings exist for this model. Also clears the
+        live ``is_pinned`` flag on the entry so no future LRU protection
+        applies.
+        """
+        manager = self._settings_manager
+        if manager is None:
+            return
+        try:
+            settings = manager.get_settings(model_id)
+        except Exception:  # pragma: no cover — defensive
+            return
+        entry = self._entries.get(model_id)
+        if not settings.is_pinned and settings.ttl_seconds is None:
+            if entry is not None:
+                entry.is_pinned = False
+            return
+        settings.is_pinned = False
+        settings.ttl_seconds = None
+        try:
+            manager.set_settings(model_id, settings)
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.warning(
+                f"Failed to clear persisted pin for '{model_id}' on release: {exc}"
+            )
+            return
+        if entry is not None:
+            entry.is_pinned = False
+        logger.info(
+            f"Released last claim on '{model_id}'; cleared pin and ttl "
+            f"so it will not preload on next startup."
+        )
 
     def set_pinned(self, model_id: str, pinned: bool) -> bool:
         """
@@ -2268,7 +2311,7 @@ class EnginePool:
                 return True
         return False
 
-    async def _unload_engine(self, model_id: str) -> None:
+    async def _unload_engine(self, model_id: str, force: bool = False) -> None:
         """
         Immediately stop and unload an engine with memory settle barrier.
 
@@ -2278,10 +2321,29 @@ class EnginePool:
 
         Args:
             model_id: The model ID to unload
+            force: When True, proceed even if the entry has active claims
+                (clearing them afterwards). When False (default), a non-empty
+                claim set causes the call to no-op — used by claim-aware
+                paths like `release()` and LRU eviction to protect models
+                still owned by external orchestrators (LocalAI).
         """
         entry = self._entries.get(model_id)
         if not entry or entry.engine is None:
             return
+
+        if entry.claims:
+            if not force:
+                logger.info(
+                    f"Skipped unload of '{model_id}': still claimed by "
+                    f"{len(entry.claims)} owner(s). Use force=True or "
+                    f"release claims first."
+                )
+                return
+            logger.warning(
+                f"Force-unloading '{model_id}' despite {len(entry.claims)} "
+                f"active claim(s): {sorted(entry.claims)}. Claimants may "
+                f"see errors on next request."
+            )
 
         logger.info(f"Unloading model: {model_id} (immediate abort)")
         distributed = self._distributed_deployment_for_entry(entry) is not None
@@ -2348,6 +2410,12 @@ class EnginePool:
         entry.pending_unload_allow_pinned = False
         entry.runtime_settings_signature = None
         entry.runtime_estimated_size = None
+
+        # Force-unload of a claimed model invalidates the claimants — drop
+        # them so later release() calls from those owners become no-ops
+        # rather than double-unloads.
+        if force and entry.claims:
+            entry.claims.clear()
 
         if distributed:
             # Cluster weights live in supervised rank processes, not this
