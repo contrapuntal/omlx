@@ -129,3 +129,7 @@ tq_batch_memory.md
 .claude/
 issues.md
 clusterPlan.md
+
+# Personal / machine-specific (not for upstream)
+docs/local-machine.md
+packaging/launchd/
