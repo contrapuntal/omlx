@@ -178,8 +178,20 @@ class VLMModelAdapter(nn.Module):
 
     @property
     def layers(self):
-        """Expose language model layers for cache creation."""
-        return self._language_model.model.layers
+        """Expose language model layers for cache creation.
+
+        mlx-vlm's ``LanguageModel`` classes use two structural patterns:
+        - Nested (Gemma3/Qwen/Mistral/LLaVA/Molmo/Moondream, most models):
+          ``self.model = SomeInnerModel(...)`` with a ``.layers`` property
+          forwarding to ``self.model.layers`` (or ``self.model.blocks``).
+        - Flat (Idefics3/SmolVLM/SmolVLM2/jina_vlm): ``self.layers`` is the
+          list of transformer blocks directly on ``LanguageModel`` — no
+          intermediate ``.model`` attribute.
+
+        Reading ``self._language_model.layers`` works for both: the nested
+        case goes through the property, the flat case reads the attribute.
+        """
+        return self._language_model.layers
 
     @property
     def model_type(self) -> str:

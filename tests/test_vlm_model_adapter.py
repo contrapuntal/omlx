@@ -33,13 +33,21 @@ class TestVLMModelAdapter:
     """Tests for VLMModelAdapter."""
 
     def _make_mock_vlm_model(self):
-        """Create a mock VLM model with language_model."""
+        """Create a mock VLM model with language_model.
+
+        Mirrors the nested pattern used by most mlx-vlm models: the
+        ``LanguageModel`` stores its transformer stack on ``self.model`` and
+        exposes a ``.layers`` property forwarding to ``self.model.layers``.
+        Both attributes are populated with the same list so tests work
+        regardless of which path the adapter reads.
+        """
         vlm_model = MagicMock()
         language_model = MagicMock()
 
-        # Set up language_model properties
+        layers = [MagicMock() for _ in range(4)]
         language_model.model = MagicMock()
-        language_model.model.layers = [MagicMock() for _ in range(4)]
+        language_model.model.layers = layers
+        language_model.layers = layers  # nested .layers property on real models
         language_model.args = MagicMock()
 
         vlm_model.language_model = language_model
@@ -61,14 +69,43 @@ class TestVLMModelAdapter:
         assert adapter._embed_offset == 0
 
     def test_layers_property(self):
-        """Test layers property delegates to language_model.model.layers."""
+        """Test layers property delegates to language_model.layers.
+
+        Using ``language_model.layers`` (not ``language_model.model.layers``)
+        handles both mlx-vlm structural patterns: nested models expose
+        ``.layers`` as a property forwarding to inner storage, while flat
+        models (Idefics3/SmolVLM/jina_vlm) store it directly.
+        """
         from omlx.models.vlm import VLMModelAdapter
 
         vlm = self._make_mock_vlm_model()
         adapter = VLMModelAdapter(vlm)
 
-        assert adapter.layers is vlm.language_model.model.layers
+        assert adapter.layers is vlm.language_model.layers
         assert len(adapter.layers) == 4
+
+    def test_layers_property_flat_language_model(self):
+        """Test layers property works when LanguageModel stores .layers directly.
+
+        Idefics3-family models (SmolVLM, SmolVLM2, jina_vlm) have no
+        ``LanguageModel.model`` attribute — the transformer list lives
+        directly on the ``LanguageModel``. Accessing ``.model.layers``
+        raises AttributeError for these models.
+        """
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm_model = MagicMock()
+        language_model = MagicMock(spec=["layers", "args", "config", "make_cache"])
+        layers = [MagicMock() for _ in range(3)]
+        language_model.layers = layers
+        vlm_model.language_model = language_model
+        vlm_model.config = MagicMock()
+        vlm_model.config.model_type = "smolvlm"
+
+        adapter = VLMModelAdapter(vlm_model)
+
+        assert adapter.layers is layers
+        assert len(adapter.layers) == 3
 
     def test_config_property(self):
         """Test config property returns vlm_model config."""
@@ -580,16 +617,16 @@ class TestVLMModelAdapterModelProperty:
     """Tests for VLMModelAdapter.model property (for nested access)."""
 
     def test_model_property(self):
-        """Test .model returns language_model.model for BatchGenerator compatibility."""
+        """Test .layers resolves through the language_model for BatchGenerator compatibility."""
         from omlx.models.vlm import VLMModelAdapter
 
         vlm = MagicMock()
-        vlm.language_model.model = MagicMock()
-        vlm.language_model.model.layers = [MagicMock()]
+        layers = [MagicMock()]
+        vlm.language_model.layers = layers
         adapter = VLMModelAdapter(vlm)
 
-        # BatchGenerator accesses model.layers
-        assert adapter.layers is vlm.language_model.model.layers
+        # BatchGenerator accesses model.layers via the adapter
+        assert adapter.layers is layers
 
 
 class TestIntOffsetCacheProxy:
