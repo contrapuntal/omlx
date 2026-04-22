@@ -48,6 +48,103 @@ logger = logging.getLogger(__name__)
 # OCR model types that require special handling.
 OCR_MODEL_TYPES = {"deepseekocr", "deepseekocr_2", "dots_ocr", "glm_ocr"}
 
+
+class _SkipDecodeModelBuild(Exception):
+    """Sentinel signalling that the mlx-lm decode model build should be skipped.
+
+    Used to bail out of the ``_build_decode_model`` try block without logging
+    a "failed" warning, e.g. when the VLM uses mRoPE and the adapter will
+    route decode through the VLM language_model regardless.
+    """
+
+
+# Text-backbone aliases for VLM configs whose ``text_config.model_type``
+# (or, for inline layouts like llava-qwen2, top-level ``model_type``) does
+# not match a module name under ``mlx_lm.models.*``.  Add entries only when
+# the mapped text model is binary-compatible with the VLM's language_model
+# weights (same layer shapes, same quantization layout) AND the VLM's on-disk
+# weights fit safely in GPU memory alongside the VLM itself during the build.
+#
+# Memory caveat: ``mlx_lm.utils.load_model`` always reads the safetensors
+# from disk (``weights.update(mx.load(wf))``) before our VLM weight overlay
+# replaces the arrays by reference.  For small VLMs (SmolVLM2 ~2 GB) the
+# transient double-allocation is invisible.  For large ones (dolphin-vision-72b
+# ~38 GB) the transient 2× memory load exceeds Metal's wired budget on the
+# 128 GB Mac Studio and causes a ``libc++abi`` SIGABRT shortly after load
+# with ``[METAL] Command buffer execution failed: Insufficient Memory``.
+#
+# Intentionally absent:
+#   "llava-qwen2": "qwen2"  — dolphin-vision-72b-4bit (38 GB) OOMs Metal
+#     during the build's transient duplicate-weight phase.  Without the alias
+#     the existing ``except Exception`` in ``_build_decode_model`` catches the
+#     "Model type llava-qwen2 not supported" ValueError, leaves
+#     ``self._lm_model = None``, and the VLMModelAdapter uses the VLM's own
+#     ``language_model`` for decode (the working pre-alias path).  Revisit
+#     if ``load_model`` gains a ``skip_weight_load`` kwarg or we implement a
+#     memory-safe ``_build_decode_model`` that constructs the model class
+#     without the intermediate ``mx.load`` step.
+_VLM_TEXT_BACKBONE_ALIASES: Dict[str, str] = {
+    "glm4v_text": "glm4",
+}
+
+
+def _vlm_aware_get_classes(config: Dict[str, Any]):
+    """mlx-lm class resolver for VLM composite configs.
+
+    Redirects ``mlx_lm.utils.load_model`` to instantiate the text backbone
+    of a VLM instead of trying (and failing) to import a module named after
+    the VLM wrapper itself.  Handles three layouts:
+
+    1. **Nested text_config with its own model_type** (SmolVLM2, GLM-4.6V,
+       most modern VLMs).  Flatten ``text_config`` fields onto the top-level
+       config so ``ModelArgs.from_dict`` sees the text backbone's shape,
+       then set ``model_type`` from ``text_config``.
+    2. **Inline text fields at top-level** (dolphin-vision / llava-qwen2
+       family).  No ``text_config`` nesting — text fields are already on
+       top-level; only the ``model_type`` needs remapping.
+    3. **Already an LLM config** (no text_config).  Pass through unchanged.
+
+    After layout resolution, apply ``_VLM_TEXT_BACKBONE_ALIASES`` to remap
+    any text-backbone model_type that is not itself an ``mlx_lm.models.*``
+    module (e.g. ``glm4v_text`` → ``glm4``).
+
+    Mutates ``cfg`` in place because ``load_model`` re-reads ``cfg`` for
+    quantization/args construction after class resolution.
+    """
+    from mlx_lm.utils import _get_classes
+
+    tc = config.get("text_config")
+    if isinstance(tc, dict) and isinstance(tc.get("model_type"), str):
+        flat_model_type = tc["model_type"]
+        for k, v in tc.items():
+            if k != "model_type":
+                config[k] = v
+        config["model_type"] = flat_model_type
+
+    # Unpack ``rope_parameters`` (Transformers 4.40+ nested format) to the
+    # flat fields mlx-lm's older ModelArgs dataclasses expect.  Only fills
+    # keys not already present so an explicit top-level value wins.
+    rope_params = config.get("rope_parameters")
+    if isinstance(rope_params, dict):
+        for k in ("rope_theta", "partial_rotary_factor", "rope_scaling"):
+            if k not in config and k in rope_params:
+                config[k] = rope_params[k]
+
+    # Derive ``head_dim`` from ``hidden_size / num_attention_heads`` when
+    # absent — a standard convention, required by some mlx-lm ModelArgs
+    # (e.g. glm4) that don't default it.
+    if config.get("head_dim") is None:
+        hs = config.get("hidden_size")
+        heads = config.get("num_attention_heads")
+        if isinstance(hs, int) and isinstance(heads, int) and heads > 0:
+            config["head_dim"] = hs // heads
+
+    mt = config.get("model_type")
+    if isinstance(mt, str):
+        config["model_type"] = _VLM_TEXT_BACKBONE_ALIASES.get(mt, mt)
+
+    return _get_classes(config)
+
 # OCR model types and their default markdown conversion prompts.
 # When an OCR model receives a generic user prompt with an image,
 # the prompt is automatically adjusted for markdown output.
@@ -92,6 +189,84 @@ OCR_MODEL_GENERATION_DEFAULTS: Dict[str, Dict[str, Any]] = {
 }
 
 _video_processor_patched = False
+_lfm2_vl_projector_patched = False
+
+
+def _patch_lfm2_vl_projector_layernorm():
+    """Force ``Lfm2VlMultiModalProjector.layer_norm`` to a real LayerNorm.
+
+    Works around ``LiquidAI/LFM2.5-VL-*-MLX-*`` checkpoints whose
+    ``config.json`` sets ``projector_use_layernorm: False`` but whose
+    safetensors still contain ``multi_modal_projector.layer_norm.{weight,bias}``
+    from the trained (LayerNorm-enabled) model.  mlx-vlm respects the flag
+    and instantiates ``nn.Identity`` for the slot, so ``load_weights``
+    (strict) rejects the residual weights and the whole VLM load fails.
+    oMLX's engine_pool then falls back to a text-only LLM engine,
+    silently losing vision capability.
+
+    Evidence this is a LiquidAI export bug, not a real architecture
+    change: the predecessor ``LFM2-VL-450M`` has no ``projector_use_layernorm``
+    key (default ``True``) and ships identical ``layer_norm.*`` weights
+    that load cleanly.  Between 2.0 and 2.5 the weights didn't change;
+    only the config flag did.
+
+    Upstream: https://github.com/Blaizzy/mlx-vlm/issues/1000, #1001, #1002
+    (all open, no maintainer response as of 2026-04-20).
+
+    Failure modes of this patch:
+    - Untouched when ``projector_use_layernorm=True`` (delegates to the
+      original ``__init__``), so any model that correctly declares the
+      LayerNorm is unaffected.
+    - If a future ``lfm2-vl`` variant genuinely ships without LayerNorm
+      (flag False AND no ``layer_norm.*`` weights), this patch will
+      create an uninitialized LayerNorm and ``strict=True`` will complain
+      about MISSING params — a loud failure that surfaces the variant,
+      not silent corruption.
+    """
+    global _lfm2_vl_projector_patched
+    if _lfm2_vl_projector_patched:
+        return
+
+    try:
+        from mlx_vlm.models.lfm2_vl.lfm2_vl import Lfm2VlMultiModalProjector
+    except ImportError:
+        return
+
+    import mlx.nn as nn
+
+    original_init = Lfm2VlMultiModalProjector.__init__
+
+    def patched_init(self, config):
+        if config.projector_use_layernorm:
+            # Correctly-configured checkpoints: untouched original behavior.
+            original_init(self, config)
+            return
+        # config says layer_norm disabled — but LiquidAI's LFM2.5 MLX
+        # exports ship the weights anyway.  Force a real LayerNorm so
+        # the weights load and decode matches the trained model.
+        nn.Module.__init__(self)
+        in_channels = (
+            config.vision_config.hidden_size * (config.downsample_factor ** 2)
+        )
+        self.layer_norm = nn.LayerNorm(in_channels)
+        self.linear_1 = nn.Linear(
+            in_channels,
+            config.projector_hidden_size,
+            bias=config.projector_bias,
+        )
+        self.linear_2 = nn.Linear(
+            config.projector_hidden_size,
+            config.text_config.hidden_size,
+            bias=config.projector_bias,
+        )
+        logger.info(
+            "lfm2-vl: forcing multi_modal_projector.layer_norm=LayerNorm "
+            "despite config.projector_use_layernorm=False "
+            "(LiquidAI LFM2.5 export bug; Blaizzy/mlx-vlm#1000-1002)"
+        )
+
+    Lfm2VlMultiModalProjector.__init__ = patched_init
+    _lfm2_vl_projector_patched = True
 
 
 def _patch_video_processor_bug():
@@ -304,6 +479,9 @@ class VLMBatchedEngine(BaseEngine):
             # when torchvision is not available (extractors is None, `in` fails).
             # oMLX does not support video input, so we skip video processing.
             _patch_video_processor_bug()
+            # Patch LiquidAI LFM2.5 export bug: config says no projector
+            # LayerNorm but weights include it.  See docstring.
+            _patch_lfm2_vl_projector_layernorm()
             return vlm_load(self._model_name)
 
         loop = asyncio.get_running_loop()
@@ -344,7 +522,21 @@ class VLMBatchedEngine(BaseEngine):
         # (MLX lazy eval) then load_weights replaces them with VLM's arrays
         # by reference — zero additional GPU memory.
         self._lm_model = None
+        # mRoPE VLMs (GLM-4.6V, Qwen3-VL, Qwen3.5-MoE-VL, etc.) route decode
+        # through the VLM's own language_model to preserve per-request
+        # rope_deltas — see ``VLMModelAdapter.__call__`` and #689. Building
+        # an mlx-lm decode model would consume the slot and never be
+        # invoked; skip it upfront to avoid misleading "Model type X not
+        # supported" warnings and the associated startup work.
+        uses_mrope = VLMModelAdapter._detect_mrope(self._vlm_model)
+        if uses_mrope:
+            logger.info(
+                "mRoPE VLM detected; skipping mlx-lm decode model build "
+                "(decode routes through VLM language_model; see #689)"
+            )
         try:
+            if uses_mrope:
+                raise _SkipDecodeModelBuild()
             from pathlib import Path as _Path
 
             from mlx.utils import tree_flatten
@@ -353,8 +545,23 @@ class VLMBatchedEngine(BaseEngine):
             def _build_decode_model():
                 # Create LM model with lazy=True: reads disk headers for correct
                 # quantized structure but does NOT evaluate weights → 0 GPU memory.
+                #
+                # ``get_model_classes=_vlm_aware_get_classes`` redirects class
+                # lookup from the VLM wrapper type (smolvlm, glm4v, llava-qwen2)
+                # to the underlying text backbone (llama, glm4, qwen2).  Without
+                # this, ``load_model`` tries to import e.g. ``mlx_lm.models.smolvlm``
+                # and falls back to the slower VLM-language_model decode path
+                # (logged as "Model type X not supported").
+                #
+                # ``strict=False`` lets the initial weight read from VLM
+                # safetensors partial-match the text-LM key names; those lazy
+                # weights are replaced by reference below with the actual VLM
+                # language_model tensors.
                 lm_model, _ = load_model(
-                    _Path(self._model_name), lazy=True
+                    _Path(self._model_name),
+                    lazy=True,
+                    strict=False,
+                    get_model_classes=_vlm_aware_get_classes,
                 )
                 # Replace lazy weights with VLM's evaluated arrays by reference.
                 # VLM params "model.*" map to LM "language_model.model.*".
@@ -371,6 +578,9 @@ class VLMBatchedEngine(BaseEngine):
                 get_mlx_executor(), _build_decode_model
             )
             logger.info("VLM decode model ready (weight sharing, zero-copy)")
+        except _SkipDecodeModelBuild:
+            # Intentional skip (e.g. mRoPE VLMs); reason already logged above.
+            pass
         except Exception as e:
             logger.warning("mlx-lm decode model failed, using vlm fallback: %s", e)
 
@@ -885,11 +1095,22 @@ class VLMBatchedEngine(BaseEngine):
             else:
                 raise
 
-        # Tokenize text and preprocess images
+        # Tokenize text and preprocess images.
+        #
+        # ``image_token_index`` is forwarded so mlx-vlm's legacy LLaVA-style
+        # branch (utils.prepare_inputs, line 1279) can splice the image
+        # placeholder into the token list. Models that take the modern
+        # HF-processor branch ignore this kwarg. Without it, llava-qwen2 /
+        # BunnyQwen (dolphin-vision) injects ``[None]`` into ``input_ids``
+        # and ``mx.array`` rejects the NoneType.
+        image_token_index = getattr(
+            getattr(self._vlm_model, "config", None), "image_token_index", None
+        )
         inputs = prepare_inputs(
             self._processor,
             images=images if images else None,
             prompts=[prompt] if isinstance(prompt, str) else prompt,
+            image_token_index=image_token_index,
         )
 
         input_ids = inputs["input_ids"]
