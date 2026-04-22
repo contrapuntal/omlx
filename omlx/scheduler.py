@@ -2957,14 +2957,25 @@ class Scheduler:
             # Setting _rope_deltas=None makes the language model use
             # _position_ids (set by get_input_embeddings) instead.
             # Saved and restored after prefill for decode rope_deltas capture.
-            # Only applies to mRoPE VLMs (Qwen2-VL, Qwen2.5-VL, GLM-4V, etc.);
-            # non-mRoPE VLMs like Gemma 4 have no _rope_deltas attribute.
+            #
+            # This dance only matters for mRoPE VLMs (Qwen3-VL, GLM-4.6V,
+            # Gemma3, etc.). Non-mRoPE VLMs (dolphin/llava-qwen2, pixtral,
+            # llava-next, paligemma, ...) never write ``_rope_deltas`` to
+            # their LanguageModel, so reading it unconditionally raises
+            # AttributeError on the first cache-hit request (``start_offset > 0``).
+            # Gating on ``_uses_mrope`` keeps the block a no-op for those.
             _saved_rope_deltas = None
-            if start_offset > 0:
-                lm = getattr(self.model, "_language_model", None)
-                if lm is not None and hasattr(lm, "_rope_deltas"):
-                    _saved_rope_deltas = lm._rope_deltas
-                    lm._rope_deltas = None
+            if (
+                start_offset > 0
+                and hasattr(self.model, "_language_model")
+                and getattr(self.model, "_uses_mrope", False)
+            ):
+                # Even for mRoPE models, the attribute may be unset before
+                # the first ``get_input_embeddings()`` call; default to None.
+                _saved_rope_deltas = getattr(
+                    self.model._language_model, "_rope_deltas", None
+                )
+                self.model._language_model._rope_deltas = None
             # Stash so the #1405 requeue path can restore it if this prefill
             # raises before the normal restore below runs.
             request._prefill_saved_rope_deltas = _saved_rope_deltas
