@@ -113,3 +113,8 @@ omlx/admin/tailwindcss-*
 
 # Git worktrees
 .worktrees/
+
+# Personal / machine-specific (not for upstream)
+docs/local-machine.md
+packaging/launchd/
+uv.lock
