@@ -51,16 +51,23 @@ def _positive_int(value: Any) -> int | None:
 
 
 def resolve_vocab_size(model: Any) -> int | None:
-    """Extract vocab_size from a model's config/args, handling nested configs.
+    """Extract vocab_size from a model, preferring the authoritative source.
 
-    For a composite (VLM) config the nested ``text_config.vocab_size`` wins
-    over the top-level ``vocab_size``: the language model's embedding and
-    ``lm_head`` are sized from the text config, while the top-level field
-    is often a dataclass placeholder that the checkpoint's ``config.json``
-    never sets (mlx-vlm's Qwen3-VL ``ModelConfig`` defaults it to 32000
-    against a 151936-token text vocabulary). Sizing the grammar bitmask
-    from that placeholder misaligns the mask with the logits, and every
-    sampled token is rejected until ``max_tokens`` (#3550). Falls back to
+    Resolution order:
+    1. The ``lm_head`` weight's first dimension (authoritative — this is the
+       exact vocabulary the model emits logits over).
+    2. ``text_config.vocab_size`` when present (the inner language model's
+       vocab on VLM composite configs).
+    3. ``model.config.vocab_size`` / ``model.args.vocab_size`` (top-level).
+
+    Why lm_head and text_config come first for VLMs: several mlx-vlm
+    ``ModelConfig`` dataclasses (e.g. glm4v, glm4v_moe, gemma3) hard-code a
+    top-level ``vocab_size`` default that does not match the inner LM vocab
+    when ``config.json`` omits the top-level key. For example, GLM-4.6V has
+    ``text_config.vocab_size=151552`` but ``ModelConfig.vocab_size=257152``
+    as a dataclass default. Sizing the grammar bitmask from that placeholder
+    misaligns the mask with the logits, and every sampled token is rejected
+    until ``max_tokens`` (#3550). Falls back to
     ``model.config.vocab_size`` / ``model.args.vocab_size`` for plain LLMs.
 
     Args:
@@ -71,6 +78,29 @@ def resolve_vocab_size(model: Any) -> int | None:
     """
     if model is None:
         return None
+
+    # 1. lm_head weight — authoritative for any model that exposes one.
+    #    VLM adapters wrap the language model under ``_language_model``;
+    #    raw mlx-lm/mlx-vlm models expose ``lm_head`` directly or under
+    #    ``language_model``.
+    for path in (
+        ("_language_model", "lm_head"),
+        ("language_model", "lm_head"),
+        ("lm_head",),
+    ):
+        obj: Any = model
+        for name in path:
+            obj = getattr(obj, name, None)
+            if obj is None:
+                break
+        weight = getattr(obj, "weight", None) if obj is not None else None
+        shape = getattr(weight, "shape", None)
+        if shape is not None and len(shape) >= 1:
+            val = _positive_int(shape[0])
+            if val is not None:
+                return val
+
+    # 2 & 3. Config-based fallbacks.
     for attr in ("config", "args"):
         config = getattr(model, attr, None)
         if config is None:
