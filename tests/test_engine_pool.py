@@ -2534,3 +2534,116 @@ class TestEnginePoolClaimRelease:
     def test_release_unknown_model_raises(self, real_pool):
         with pytest.raises(ModelNotFoundError):
             asyncio.run(real_pool.release("nonexistent", "token-A"))
+
+    def test_unload_engine_skips_when_claimed(self, small_mock_model_dir):
+        """`_unload_engine` without force must bail when claims are non-empty.
+
+        Protects LocalAI-owned models from admin-driven teardown when the
+        caller did not explicitly opt into force-unload.
+        """
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        entry = pool._entries["model-a"]
+        # Simulate loaded engine + active claim.
+        mock_engine = MagicMock()
+        mock_engine.stop = AsyncMock()
+        entry.engine = mock_engine
+        entry.claims.add("localai-owner-1")
+
+        asyncio.run(pool._unload_engine("model-a"))
+
+        assert entry.engine is mock_engine, "Claim-blind unload is forbidden"
+        assert entry.claims == {"localai-owner-1"}
+        mock_engine.stop.assert_not_called()
+
+    def test_unload_engine_forces_when_claimed_and_force_true(
+        self, small_mock_model_dir
+    ):
+        """`force=True` overrides claim guard and clears the claim set.
+
+        Models unloaded this way leave dangling owners that will observe the
+        teardown on their next request — a warn-and-proceed policy.
+        """
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        entry = pool._entries["model-a"]
+        mock_engine = MagicMock()
+        mock_engine.stop = AsyncMock()
+        entry.engine = mock_engine
+        entry.claims.add("localai-owner-1")
+        pool._current_model_memory = entry.estimated_size
+
+        with patch("omlx.engine_pool.mx") as mock_mx:
+            mock_mx.get_active_memory.return_value = 0
+            mock_mx.synchronize = MagicMock()
+            mock_mx.clear_cache = MagicMock()
+            asyncio.run(pool._unload_engine("model-a", force=True))
+
+        assert entry.engine is None
+        assert entry.claims == set(), "Force-unload must clear stale claims"
+        mock_engine.stop.assert_awaited_once()
+
+    def test_release_clears_persisted_pin(self, small_mock_model_dir, tmp_path):
+        """release() clearing the last claim must also clear pin + ttl.
+
+        Otherwise oMLX restart preloads the model LocalAI just released —
+        resurrecting ownership state the orchestrator no longer expects.
+        """
+        from omlx.model_settings import ModelSettings, ModelSettingsManager
+
+        settings_manager = ModelSettingsManager(base_path=tmp_path / "settings1")
+        settings_manager.set_settings(
+            "model-a",
+            ModelSettings(is_pinned=True, ttl_seconds=None),
+        )
+
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        pool._settings_manager = settings_manager
+
+        pool.unload_calls = []  # type: ignore[attr-defined]
+
+        async def _recording_unload(model_id: str, force: bool = False) -> None:
+            pool.unload_calls.append((model_id, force))  # type: ignore[attr-defined]
+            entry = pool._entries.get(model_id)
+            if entry is not None:
+                entry.engine = None
+
+        pool._unload_engine = _recording_unload  # type: ignore[assignment]
+
+        asyncio.run(pool.claim("model-a", "localai-owner-1"))
+        pool._entries["model-a"].engine = MagicMock()
+        remaining, unloaded = asyncio.run(
+            pool.release("model-a", "localai-owner-1")
+        )
+
+        assert remaining == []
+        assert unloaded is True
+        final = settings_manager.get_settings("model-a")
+        assert final.is_pinned is False
+        assert final.ttl_seconds is None
+
+    def test_release_clears_pin_even_when_not_loaded(
+        self, small_mock_model_dir, tmp_path
+    ):
+        """Edge: release with no live engine must still clear persisted pin."""
+        from omlx.model_settings import ModelSettings, ModelSettingsManager
+
+        settings_manager = ModelSettingsManager(base_path=tmp_path / "settings2")
+        settings_manager.set_settings(
+            "model-a", ModelSettings(is_pinned=True, ttl_seconds=120)
+        )
+
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        pool._settings_manager = settings_manager
+
+        asyncio.run(pool.claim("model-a", "owner-x"))
+        assert pool._entries["model-a"].engine is None
+        remaining, unloaded = asyncio.run(pool.release("model-a", "owner-x"))
+
+        assert remaining == []
+        assert unloaded is False
+        final = settings_manager.get_settings("model-a")
+        assert final.is_pinned is False
+        assert final.ttl_seconds is None

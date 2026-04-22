@@ -782,11 +782,13 @@ async def _apply_model_dirs_runtime(model_dirs: list[str]) -> tuple[bool, str]:
     if _server_state.settings_manager is not None:
         pinned_models = _server_state.settings_manager.get_pinned_model_ids()
 
-    # Unload all loaded models
+    # Unload all loaded models. Admin-driven model-dir change wins over
+    # active claims (warn-and-proceed): LocalAI will observe the teardown
+    # and reconcile on its next LoadModel.
     loaded_models = pool.get_loaded_model_ids()
     for model_id in loaded_models:
         try:
-            await pool._unload_engine(model_id)
+            await pool._unload_engine(model_id, force=True)
         except Exception as e:
             logger.warning(f"Error unloading {model_id}: {e}")
 
@@ -990,11 +992,13 @@ async def _apply_cache_settings_runtime(
     if hasattr(pool, "configure_hot_cache_budget"):
         pool.configure_hot_cache_budget()
 
-    # Unload all loaded models so they use new config when reloaded
+    # Unload all loaded models so they use new config when reloaded.
+    # Admin-driven cache-settings change wins over active claims
+    # (warn-and-proceed); LocalAI reconciles on next LoadModel.
     loaded_models = pool.get_loaded_model_ids()
     for model_id in loaded_models:
         try:
-            await pool._unload_engine(model_id)
+            await pool._unload_engine(model_id, force=True)
         except Exception as e:
             logger.warning(f"Error unloading {model_id}: {e}")
 
@@ -2064,7 +2068,8 @@ async def unload_model(
     if entry.engine is None:
         raise HTTPException(status_code=400, detail=f"Model not loaded: {model_id}")
 
-    await engine_pool._unload_engine(model_id)
+    # No owner supplied — this path is explicit admin force-unload.
+    await engine_pool._unload_engine(model_id, force=True)
     logger.info(f"Manually unloaded model: {model_id}")
     return {"status": "ok", "model_id": model_id, "message": f"Unloaded {model_id}"}
 
@@ -5468,12 +5473,12 @@ async def delete_hf_model(
     if not model_path.is_dir():
         raise HTTPException(status_code=400, detail="Not a model directory")
 
-    # Unload model if loaded
+    # Unload model if loaded. Deletion is terminal — force past claims.
     if engine_pool is not None:
         loaded_ids = engine_pool.get_loaded_model_ids()
         if model_name in loaded_ids:
             try:
-                await engine_pool._unload_engine(model_name)
+                await engine_pool._unload_engine(model_name, force=True)
                 logger.info(f"Unloaded model '{model_name}' before deletion")
             except Exception as e:
                 logger.warning(f"Failed to unload model '{model_name}': {e}")
