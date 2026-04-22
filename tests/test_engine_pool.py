@@ -1401,3 +1401,82 @@ class TestMemorySettleBarrier:
 
         assert pool._entries["model-a"].engine is None
         assert pool._current_model_memory == 0
+
+
+class TestEnginePoolClaimRelease:
+    """Real-EnginePool coverage for claim()/release() refcounting.
+
+    Only `_unload_engine` is monkey-patched (the heavy MLX path). claim/release
+    themselves run against the production implementation.
+    """
+
+    @pytest.fixture
+    def real_pool(self, small_mock_model_dir):
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        pool.unload_calls = []  # type: ignore[attr-defined]
+
+        async def _recording_unload(model_id: str) -> None:
+            pool.unload_calls.append(model_id)  # type: ignore[attr-defined]
+            entry = pool._entries.get(model_id)
+            if entry is not None:
+                entry.engine = None
+
+        pool._unload_engine = _recording_unload  # type: ignore[assignment]
+        return pool
+
+    def test_claim_adds_owner(self, real_pool):
+        claims = asyncio.run(real_pool.claim("model-a", "token-A"))
+        assert claims == ["token-A"]
+        assert real_pool._entries["model-a"].claims == {"token-A"}
+
+    def test_claim_is_idempotent(self, real_pool):
+        asyncio.run(real_pool.claim("model-a", "token-A"))
+        claims = asyncio.run(real_pool.claim("model-a", "token-A"))
+        assert claims == ["token-A"]
+        assert real_pool._entries["model-a"].claims == {"token-A"}
+
+    def test_claim_unknown_model_raises(self, real_pool):
+        with pytest.raises(ModelNotFoundError):
+            asyncio.run(real_pool.claim("nonexistent", "token-A"))
+
+    def test_release_removes_owner(self, real_pool):
+        asyncio.run(real_pool.claim("model-a", "token-A"))
+        asyncio.run(real_pool.claim("model-a", "token-B"))
+        # Simulate a loaded engine so the refcount-only branch is exercised.
+        real_pool._entries["model-a"].engine = MagicMock()
+        remaining, unloaded = asyncio.run(real_pool.release("model-a", "token-A"))
+        assert remaining == ["token-B"]
+        assert unloaded is False
+        assert real_pool.unload_calls == []
+
+    def test_release_when_empty_and_loaded_unloads_once(self, real_pool):
+        asyncio.run(real_pool.claim("model-a", "token-A"))
+        real_pool._entries["model-a"].engine = MagicMock()
+        remaining, unloaded = asyncio.run(real_pool.release("model-a", "token-A"))
+        assert remaining == []
+        assert unloaded is True
+        assert real_pool.unload_calls == ["model-a"]
+
+    def test_release_never_claimed_is_noop(self, real_pool):
+        # No prior claim by this owner (or anyone). discard() makes it a no-op.
+        remaining, unloaded = asyncio.run(
+            real_pool.release("model-a", "token-ghost")
+        )
+        assert remaining == []
+        assert unloaded is False
+        assert real_pool.unload_calls == []
+
+    def test_release_when_already_unloaded_is_noop(self, real_pool):
+        # Empty claim set AND engine is None -> no unload call, no raise.
+        assert real_pool._entries["model-a"].engine is None
+        remaining, unloaded = asyncio.run(
+            real_pool.release("model-a", "token-A")
+        )
+        assert remaining == []
+        assert unloaded is False
+        assert real_pool.unload_calls == []
+
+    def test_release_unknown_model_raises(self, real_pool):
+        with pytest.raises(ModelNotFoundError):
+            asyncio.run(real_pool.release("nonexistent", "token-A"))
