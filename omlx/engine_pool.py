@@ -63,6 +63,11 @@ class EngineEntry:
     is_loading: bool = False  # Prevent concurrent loads
     is_pinned: bool = False  # Never evict if True
     abort_loading: bool = False  # Set by memory enforcer to abort in-progress load
+    # Owner tokens that have claimed this model. When the set empties (via
+    # release), the engine is physically unloaded. Used by external
+    # orchestrators (e.g. LocalAI) to safely share oMLX across multiple
+    # frontend subprocesses without premature eviction.
+    claims: set[str] = field(default_factory=set)
 
 
 class EnginePool:
@@ -225,6 +230,40 @@ class EnginePool:
     def get_entry(self, model_id: str) -> EngineEntry | None:
         """Get entry for a specific model, or None if not found."""
         return self._entries.get(model_id)
+
+    async def claim(self, model_id: str, owner: str) -> list[str]:
+        """Register *owner* as a claimant on *model_id*.
+
+        Idempotent: a second claim from the same owner is a no-op. Returns
+        the sorted list of current claim owners. Raises ``ModelNotFoundError``
+        if *model_id* is not a discovered model.
+        """
+        async with self._lock:
+            entry = self._entries.get(model_id)
+            if entry is None:
+                raise ModelNotFoundError(model_id, list(self._entries.keys()))
+            entry.claims.add(owner)
+            return sorted(entry.claims)
+
+    async def release(self, model_id: str, owner: str) -> tuple[list[str], bool]:
+        """Remove *owner* from the claim set for *model_id*.
+
+        When the claim set becomes empty and the engine is currently loaded,
+        the engine is physically unloaded (via ``_unload_engine``). Returns
+        ``(remaining_claims, unloaded)``. ``discard`` — not ``remove`` — is
+        used so unknown owners are a no-op rather than a hard error. Raises
+        ``ModelNotFoundError`` if *model_id* is not a discovered model.
+        """
+        async with self._lock:
+            entry = self._entries.get(model_id)
+            if entry is None:
+                raise ModelNotFoundError(model_id, list(self._entries.keys()))
+            entry.claims.discard(owner)
+            remaining = sorted(entry.claims)
+            if not remaining and entry.engine is not None:
+                await self._unload_engine(model_id)
+                return remaining, True
+            return remaining, False
 
     def set_pinned(self, model_id: str, pinned: bool) -> bool:
         """
