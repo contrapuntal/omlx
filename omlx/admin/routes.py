@@ -57,6 +57,7 @@ from .auth import (
     verify_api_key,
     verify_session,
 )
+from ..exceptions import ModelNotFoundError
 
 logger = logging.getLogger(__name__)
 
@@ -2082,12 +2083,74 @@ async def list_models(is_admin: bool = Depends(require_admin)):
     return {"models": models}
 
 
+class ClaimRequest(BaseModel):
+    """Request body for /claim and /release endpoints."""
+
+    owner: str = Field(..., min_length=1, description="Opaque owner token")
+
+
+@router.post("/api/models/{model_id}/claim")
+async def claim_model(
+    model_id: str,
+    body: ClaimRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """Register an owner token on the model's claim set.
+
+    Idempotent: repeat claims from the same owner are a no-op. External
+    orchestrators (e.g. LocalAI) use this to pin the model while they
+    hold a live gRPC subprocess.
+    """
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+    try:
+        claims = await engine_pool.claim(model_id, body.owner)
+    except ModelNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"status": "ok", "model_id": model_id, "claims": claims}
+
+
+@router.post("/api/models/{model_id}/release")
+async def release_model(
+    model_id: str,
+    body: ClaimRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """Remove an owner from the claim set.
+
+    When the claim set becomes empty and an engine is loaded, it is
+    physically unloaded. Unknown owners are ignored (not a hard error),
+    so release is safe to call defensively on shutdown.
+    """
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+    try:
+        remaining, unloaded = await engine_pool.release(model_id, body.owner)
+    except ModelNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {
+        "status": "ok",
+        "model_id": model_id,
+        "claims": remaining,
+        "unloaded": unloaded,
+    }
+
+
 @router.post("/api/models/{model_id}/unload")
 async def unload_model(
     model_id: str,
+    owner: str | None = None,
     is_admin: bool = Depends(require_admin),
 ):
-    """Manually unload a model from memory."""
+    """Unload a model from memory.
+
+    When *owner* is supplied (as a query parameter), behaves like
+    ``/release``: removes that owner from the claim set and only
+    physically unloads when no claims remain. Without *owner*, keeps the
+    original force-unload behaviour for backward compatibility.
+    """
     engine_pool = _get_engine_pool()
     if engine_pool is None:
         raise HTTPException(status_code=503, detail="Engine pool not initialized")
@@ -2095,6 +2158,17 @@ async def unload_model(
     entry = engine_pool.get_entry(model_id)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+
+    if owner is not None:
+        remaining, unloaded = await engine_pool.release(model_id, owner)
+        return {
+            "status": "ok",
+            "model_id": model_id,
+            "claims": remaining,
+            "still_claimed": bool(remaining),
+            "unloaded": unloaded,
+        }
+
     if entry.engine is None:
         raise HTTPException(status_code=400, detail=f"Model not loaded: {model_id}")
     if entry.is_loading:
