@@ -311,6 +311,7 @@ class EngineEntry:
     abort_requested: bool = False  # Set under hard pressure for leased requests
     pending_unload_reason: str | None = None  # Unload as soon as leases/activity drain
     pending_unload_allow_pinned: bool = False  # Explicit unload may override pinning
+    pending_unload_force: bool = False  # Explicit unload wins over claim ownership
     # Requested load-time variant. This deliberately tracks the settings that
     # produced the engine, even when an optional accelerator fails soft and the
     # engine falls back, so identical requests keep reusing that fallback.
@@ -1602,6 +1603,7 @@ class EnginePool:
                 pending_task.cancel()
             entry.pending_unload_reason = None
             entry.pending_unload_allow_pinned = False
+            entry.pending_unload_force = False
             entry.abort_requested = False
             if entry.engine is None:
                 self._clear_load_failure(entry)
@@ -1678,14 +1680,64 @@ class EnginePool:
                 raise ModelNotFoundError(model_id, list(self._entries.keys()))
             entry.claims.discard(owner)
             remaining = sorted(entry.claims)
+            if not remaining:
+                # Last claim dropped. Clear any persisted pin/ttl that a
+                # prior owner (e.g. LocalAI's LoadModel) set via
+                # update_settings. Otherwise the model preloads on next
+                # oMLX startup and resurrects ownership state the
+                # orchestrator no longer expects (I-5).
+                self._clear_persisted_pin_on_release(model_id)
             if not remaining and entry.engine is not None:
                 # Unload under the lock matches existing convention (see ~361, ~876, ~939);
                 # _unload_engine can take seconds (MLX sync + settle barrier). If this ever
                 # becomes a measurable hot path under LocalAI contention, refactor
                 # _unload_engine to release the lock around the slow section, not release().
                 await self._unload_engine(model_id)
+                # release() owns teardown once claims exist: drop any stale
+                # pending-unload marker (e.g. from a settings-change request
+                # that was blocked by these claims) so later drain checks do
+                # not act on it.
+                entry.pending_unload_reason = None
+                entry.pending_unload_allow_pinned = False
+                entry.pending_unload_force = False
                 return remaining, True
             return remaining, False
+
+    def _clear_persisted_pin_on_release(self, model_id: str) -> None:
+        """Clear persisted pin + ttl when the last claim on *model_id* drops.
+
+        Best-effort: silently no-ops if no settings manager is attached or
+        if no persisted settings exist for this model. Also clears the
+        live ``is_pinned`` flag on the entry so no future LRU protection
+        applies.
+        """
+        manager = self._settings_manager
+        if manager is None:
+            return
+        try:
+            settings = manager.get_settings(model_id)
+        except Exception:  # pragma: no cover — defensive
+            return
+        entry = self._entries.get(model_id)
+        if not settings.is_pinned and settings.ttl_seconds is None:
+            if entry is not None:
+                entry.is_pinned = False
+            return
+        settings.is_pinned = False
+        settings.ttl_seconds = None
+        try:
+            manager.set_settings(model_id, settings)
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.warning(
+                f"Failed to clear persisted pin for '{model_id}' on release: {exc}"
+            )
+            return
+        if entry is not None:
+            entry.is_pinned = False
+        logger.info(
+            f"Released last claim on '{model_id}'; cleared pin and ttl "
+            f"so it will not preload on next startup."
+        )
 
     def set_pinned(self, model_id: str, pinned: bool) -> bool:
         """
@@ -1943,16 +1995,32 @@ class EnginePool:
         ):
             return False
 
+        if entry.claims and not entry.pending_unload_force:
+            # Claim ownership wins over a non-forced pending unload.
+            # release() owns the teardown lifecycle once claims exist, so
+            # drop the marker instead of spinning on an unload that would
+            # no-op. Callers treat False as "not unloaded, defer".
+            entry.pending_unload_reason = None
+            entry.pending_unload_allow_pinned = False
+            logger.info(
+                "Skipped pending unload of '%s': still claimed by %d owner(s).",
+                model_id,
+                len(entry.claims),
+            )
+            return False
+
         reason = entry.pending_unload_reason
         entry.pending_unload_reason = None
         entry.pending_unload_allow_pinned = False
+        force = entry.pending_unload_force
+        entry.pending_unload_force = False
         entry.abort_requested = False
         logger.warning(
             "Unloading pending model '%s' after activity drained (%s)",
             model_id,
             reason,
         )
-        await self._unload_engine(model_id)
+        await self._unload_engine(model_id, force=force)
         return True
 
     def _finish_pending_unload_task(
@@ -2005,6 +2073,7 @@ class EnginePool:
         *,
         reason: str = "manual unload",
         abort_active: bool = True,
+        force: bool = False,
     ) -> bool:
         """Unload now when idle, otherwise abort and unload after quiescence.
 
@@ -2012,6 +2081,8 @@ class EnginePool:
         False when teardown was queued. New acquisitions are rejected while the
         pending marker is installed, so the engine can drain deterministically.
         With ``abort_active=False`` in-flight work and leases finish first.
+        With ``force=True`` an explicit admin action wins over claim ownership
+        (claimants are warned); otherwise a claimed model is left loaded.
         """
         async with self._lock:
             entry = self._entries.get(model_id)
@@ -2023,7 +2094,17 @@ class EnginePool:
                     f"Model '{model_id}' is still loading and cannot be unloaded yet",
                 )
             if self._entry_is_quiescent(entry):
-                await self._unload_engine(model_id)
+                if entry.claims and not force:
+                    # Claim guard would no-op inside _unload_engine; report
+                    # honestly so callers (e.g. settings auto-unload) defer
+                    # instead of reloading a model that is still serving.
+                    logger.info(
+                        "Skipped unload of '%s': still claimed by %d owner(s).",
+                        model_id,
+                        len(entry.claims),
+                    )
+                    return False
+                await self._unload_engine(model_id, force=force)
                 return True
 
             self._mark_pending_unload_locked(
@@ -2032,6 +2113,8 @@ class EnginePool:
                 abort_requested=abort_active,
                 allow_pinned=True,
             )
+            if force:
+                entry.pending_unload_force = True
             abort_all = getattr(entry.engine, "abort_all_requests", None)
             if abort_active and callable(abort_all):
                 try:
@@ -2984,7 +3067,42 @@ class EnginePool:
                 return True
         return False
 
-    async def _unload_engine(self, model_id: str, *, local_only: bool = False) -> None:
+    async def _unload_engine(
+        self, model_id: str, *, local_only: bool = False, force: bool = False
+    ) -> None:
+        """Stop and unload an engine, honoring claim ownership.
+
+        Claim guard (external-orchestrator ownership): when the entry has
+        active claims and ``force`` is False, the unload is a no-op — used
+        by claim-aware paths like ``release()`` and LRU eviction. Explicit
+        admin actions pass ``force=True``; claimants are warned and their
+        claims cleared afterwards so later ``release()`` calls from those
+        owners become no-ops rather than double-unloads.
+
+        Teardown itself is serialized per model via ``_unloading_models``
+        and delegated to ``_stop_and_unload_engine``.
+
+        Args:
+            model_id: The model ID to unload
+            local_only: When True, only unload the local engine
+            force: When True, proceed even if the entry has active claims
+                (clearing them afterwards). When False (default), a non-empty
+                claim set causes the call to no-op.
+        """
+        entry = self._entries.get(model_id)
+        if entry is not None and entry.engine is not None and entry.claims:
+            if not force:
+                logger.info(
+                    f"Skipped unload of '{model_id}': still claimed by "
+                    f"{len(entry.claims)} owner(s). Use force=True or "
+                    f"release claims first."
+                )
+                return
+            logger.warning(
+                f"Force-unloading '{model_id}' despite {len(entry.claims)} "
+                f"active claim(s): {sorted(entry.claims)}. Claimants may "
+                f"see errors on next request."
+            )
         if model_id in self._unloading_models:
             raise ModelBusyError(model_id, "unload while teardown is in progress")
         self._unloading_models.add(model_id)
@@ -3003,6 +3121,11 @@ class EnginePool:
             task.result()
         finally:
             self._unloading_models.discard(model_id)
+        # Force-unload of a claimed model invalidates the claimants — drop
+        # them so later release() calls from those owners become no-ops
+        # rather than double-unloads.
+        if force and entry is not None and entry.claims:
+            entry.claims.clear()
         if cancelled:
             raise asyncio.CancelledError
 
