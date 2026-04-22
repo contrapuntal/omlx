@@ -158,3 +158,21 @@ def test_unload_without_owner_force_unloads(client, fake_pool_with_model):
     r = client.post("/admin/api/models/test-model/unload")
     assert r.status_code == 200, r.text
     assert fake_pool_with_model.get_entry("test-model").engine is None
+
+
+def test_release_when_already_unloaded_is_noop(client, fake_pool_with_model):
+    """Release on a model with no engine and no claims is a quiet no-op.
+
+    Covers the idempotency path: returns ([], False) and does not raise,
+    even when the engine was never loaded / already unloaded.
+    """
+    # Engine starts truthy in FakeEntry; simulate "already unloaded".
+    fake_pool_with_model.get_entry("test-model").engine = None
+    r = client.post(
+        "/admin/api/models/test-model/release", json={"owner": "token-A"}
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["claims"] == []
+    assert body["unloaded"] is False
+    assert fake_pool_with_model.unload_calls == []
