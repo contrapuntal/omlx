@@ -123,3 +123,7 @@ docs/native_app_architecture.md
 uv.lock
 # generated TurboQuant memory report (machine-specific)
 tq_batch_memory.md
+
+# Personal / machine-specific (not for upstream)
+docs/local-machine.md
+packaging/launchd/
