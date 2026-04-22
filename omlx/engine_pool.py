@@ -1116,6 +1116,10 @@ class EnginePool:
             entry.claims.discard(owner)
             remaining = sorted(entry.claims)
             if not remaining and entry.engine is not None:
+                # Unload under the lock matches existing convention (see ~361, ~876, ~939);
+                # _unload_engine can take seconds (MLX sync + settle barrier). If this ever
+                # becomes a measurable hot path under LocalAI contention, refactor
+                # _unload_engine to release the lock around the slow section, not release().
                 await self._unload_engine(model_id)
                 return remaining, True
             return remaining, False
