@@ -198,10 +198,32 @@ class MLXRerankerModel:
         patch_qwen3_vl_processor_for_torch_free_image_loading()
         from mlx_embeddings import load as mlx_emb_load
 
-        return mlx_emb_load(
+        model, processor = mlx_emb_load(
             str(self.model_name),
             tokenizer_config={"trust_remote_code": self.trust_remote_code},
         )
+        self._repair_processor_multimodal_token_ids(processor)
+        return model, processor
+
+    def _repair_processor_multimodal_token_ids(self, processor: Any) -> None:
+        """Restore ProcessorMixin token-id lists on synthetic multimodal processors.
+
+        mlx-embeddings can construct Qwen3-VL processors without running the
+        usual ProcessorMixin initialization. Transformers then expects
+        image_ids/video_ids/audio_ids to exist during chat-template expansion.
+        """
+        candidates = [processor]
+        inner = getattr(processor, "processor", None)
+        if inner is not None and inner is not processor:
+            candidates.append(inner)
+
+        for candidate in candidates:
+            if not hasattr(candidate, "image_ids"):
+                candidate.image_ids = [getattr(candidate, "image_token_id", None)]
+            if not hasattr(candidate, "video_ids"):
+                candidate.video_ids = [getattr(candidate, "video_token_id", None)]
+            if not hasattr(candidate, "audio_ids"):
+                candidate.audio_ids = [getattr(candidate, "audio_token_id", None)]
 
     def _build_vl_item(self, item: "str | dict[str, Any]") -> Dict[str, Any]:
         """Normalize a rerank input into the mlx-embeddings VL item format.
