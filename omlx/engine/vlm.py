@@ -87,6 +87,13 @@ _VLM_TEXT_BACKBONE_ALIASES: Dict[str, str] = {
     "glm4v_text": "glm4",
 }
 
+# Composite VLM wrappers whose top-level mlx-lm module is already the correct
+# text-only decode model. Keep the wrapper intact so quantization paths such as
+# ``language_model.model.*`` still line up with the checkpoint weights.
+_VLM_NATIVE_TEXT_WRAPPERS = {
+    "gemma4",
+}
+
 
 def _vlm_aware_get_classes(config: Dict[str, Any]):
     """mlx-lm class resolver for VLM composite configs.
@@ -99,6 +106,9 @@ def _vlm_aware_get_classes(config: Dict[str, Any]):
        most modern VLMs).  Flatten ``text_config`` fields onto the top-level
        config so ``ModelArgs.from_dict`` sees the text backbone's shape,
        then set ``model_type`` from ``text_config``.
+       Exception: keep native text-only wrappers like ``gemma4`` intact
+       because mlx-lm already exposes the right composite class and its
+       quantization paths are keyed against the wrapper layout.
     2. **Inline text fields at top-level** (dolphin-vision / llava-qwen2
        family).  No ``text_config`` nesting — text fields are already on
        top-level; only the ``model_type`` needs remapping.
@@ -114,7 +124,12 @@ def _vlm_aware_get_classes(config: Dict[str, Any]):
     from mlx_lm.utils import _get_classes
 
     tc = config.get("text_config")
-    if isinstance(tc, dict) and isinstance(tc.get("model_type"), str):
+    keep_wrapper = config.get("model_type") in _VLM_NATIVE_TEXT_WRAPPERS
+    if (
+        not keep_wrapper
+        and isinstance(tc, dict)
+        and isinstance(tc.get("model_type"), str)
+    ):
         flat_model_type = tc["model_type"]
         for k, v in tc.items():
             if k != "model_type":

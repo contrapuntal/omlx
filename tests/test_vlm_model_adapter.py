@@ -673,3 +673,68 @@ class TestIntOffsetCacheProxy:
         assert proxy.offset == 625
         assert isinstance(proxy.offset, int)
 
+
+
+class TestVlmAwareGetClasses:
+    """Tests for `_vlm_aware_get_classes` config mutation logic."""
+
+    def test_preserves_gemma4_wrapper_for_nested_text_config(self):
+        """Gemma-4 must keep its native wrapper so quantized paths still match.
+
+        Flattening `text_config` into a direct `gemma4_text` load drops the
+        composite `language_model.model.*` quantization layout that the MLX
+        checkpoint uses. That causes the later zero-copy overlay to stuff
+        packed 8-bit weights into unquantized modules by name.
+        """
+        from omlx.engine.vlm import _vlm_aware_get_classes
+
+        config = {
+            "model_type": "gemma4",
+            "text_config": {
+                "model_type": "gemma4_text",
+                "hidden_size": 2816,
+                "num_attention_heads": 16,
+            },
+            "quantization": {
+                "group_size": 64,
+                "bits": 8,
+                "language_model.model.embed_tokens": {"group_size": 64, "bits": 8},
+            },
+        }
+
+        with patch(
+            "mlx_lm.utils._get_classes",
+            return_value=("Gemma4Model", "Gemma4Args"),
+        ) as get_classes:
+            result = _vlm_aware_get_classes(config)
+
+        assert result == ("Gemma4Model", "Gemma4Args")
+        get_classes.assert_called_once_with(config)
+        assert config["model_type"] == "gemma4"
+        assert "hidden_size" not in config
+        assert config["text_config"]["model_type"] == "gemma4_text"
+
+    def test_flattens_unsupported_nested_text_config(self):
+        """Unsupported VLM wrappers should still redirect to the text backbone."""
+        from omlx.engine.vlm import _vlm_aware_get_classes
+
+        config = {
+            "model_type": "smolvlm2",
+            "text_config": {
+                "model_type": "llama",
+                "hidden_size": 2048,
+                "num_attention_heads": 16,
+            },
+        }
+
+        with patch(
+            "mlx_lm.utils._get_classes",
+            return_value=("LlamaModel", "LlamaArgs"),
+        ) as get_classes:
+            result = _vlm_aware_get_classes(config)
+
+        assert result == ("LlamaModel", "LlamaArgs")
+        get_classes.assert_called_once_with(config)
+        assert config["model_type"] == "llama"
+        assert config["hidden_size"] == 2048
+        assert config["num_attention_heads"] == 16
