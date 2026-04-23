@@ -3403,6 +3403,18 @@ class TestSerializeToolCallArguments:
         assert result == "{}"
         assert any("non-dict" in r.message for r in caplog.records)
 
+    def test_json_object_string_preserves_unicode(self):
+        raw = '{"city": "서울"}'
+        result = _serialize_tool_call_arguments(raw)
+        assert json.loads(result) == {"city": "서울"}
+
+    def test_malformed_json_string_coerced(self, caplog):
+        """Unparseable strings still coerce to {} with a warning."""
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            result = _serialize_tool_call_arguments('{"path": ')
+        assert result == "{}"
+        assert any("non-dict" in r.message for r in caplog.records)
+
 
 class TestToolCallStreamFilterGemma4StrayClose:
     """Stray closing-marker suppression for Gemma 4 <|tool_call>/<tool_call|>."""
@@ -4435,3 +4447,35 @@ def test_bracket_deep_decode_never_runs_raw_arguments():
         for call in calls or []:
             if call.function.name == "bad":
                 assert not call.function.arguments.startswith('{"raw":')
+
+
+class TestParseToolCallsStringifiedArguments:
+    """Regression for parser output where ``arguments`` arrives as a JSON
+    string (the shape mlx-lm's json_tools parser produces for spec-compliant
+    double-encoded OpenAI-style tool calls). The string must survive to
+    ToolCall.function.arguments, not be coerced to ``{}``.
+    """
+
+    def test_native_parser_returns_string_arguments(self):
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = lambda text, tools: {
+            "name": "Read",
+            "arguments": '{"path": "docs/plans/2026-04-22-omlx-config-implementation.md"}',
+        }
+
+        text = (
+            '<tool_call>{"name": "Read", "arguments": '
+            '"{\\"path\\": \\"docs/plans/2026-04-22-omlx-config-implementation.md\\"}"}'
+            "</tool_call>"
+        )
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "Read"
+        assert json.loads(tool_calls[0].function.arguments) == {
+            "path": "docs/plans/2026-04-22-omlx-config-implementation.md"
+        }
+
