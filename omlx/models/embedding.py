@@ -330,6 +330,7 @@ class MLXEmbeddingModel:
                 tokenizer_config={"trust_remote_code": self.trust_remote_code},
             )
             patch_modernbert_attention(self.model)
+            self._repair_processor_multimodal_token_ids(self.processor)
 
             if hasattr(self.model, "config"):
                 config = self.model.config
@@ -361,6 +362,27 @@ class MLXEmbeddingModel:
         except Exception as e:
             logger.error(f"Failed to load embedding model: {e}")
             raise
+
+    def _repair_processor_multimodal_token_ids(self, processor: Any) -> None:
+        """Restore ProcessorMixin token-id lists on synthetic multimodal processors.
+
+        mlx-embeddings builds its Qwen3-VL processor with object.__new__ to avoid
+        unsupported video initialization paths. Newer Transformers expects
+        ProcessorMixin.__init__ side effects such as image_ids/video_ids/audio_ids
+        to exist when apply_chat_template calls create_mm_token_type_ids.
+        """
+        candidates = [processor]
+        inner = getattr(processor, "processor", None)
+        if inner is not None and inner is not processor:
+            candidates.append(inner)
+
+        for candidate in candidates:
+            if not hasattr(candidate, "image_ids"):
+                candidate.image_ids = [getattr(candidate, "image_token_id", None)]
+            if not hasattr(candidate, "video_ids"):
+                candidate.video_ids = [getattr(candidate, "video_token_id", None)]
+            if not hasattr(candidate, "audio_ids"):
+                candidate.audio_ids = [getattr(candidate, "audio_token_id", None)]
 
     def _extract_embeddings_array(self, outputs, attention_mask=None):
         """Extract embedding tensor from model outputs as a 2D (batch, hidden) array."""
