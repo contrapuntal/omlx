@@ -2,6 +2,7 @@
 """Tests for multimodal (Qwen3-VL) reranker support."""
 
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -111,6 +112,27 @@ class TestVLItemBuilder:
 
 
 class TestVLRerankScoring:
+    def test_load_vl_reranker_repairs_missing_multimodal_token_ids(self, tmp_path):
+        model = MLXRerankerModel(str(tmp_path))
+
+        inner = SimpleNamespace(
+            image_token_id=151655,
+            video_token_id=151656,
+            audio_token_id=None,
+        )
+        processor = SimpleNamespace(processor=inner)
+
+        with patch("mlx_embeddings.load", return_value=(MagicMock(), processor)):
+            _, loaded_processor = model._load_vl_reranker()
+
+        assert loaded_processor is processor
+        assert processor.image_ids == [None]
+        assert processor.video_ids == [None]
+        assert processor.audio_ids == [None]
+        assert inner.image_ids == [151655]
+        assert inner.video_ids == [151656]
+        assert inner.audio_ids == [None]
+
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     def test_rerank_vl_wraps_process_output(self, tmp_path):
         """_rerank_vl sorts model.process() scores into RerankOutput."""
