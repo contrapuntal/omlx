@@ -466,6 +466,35 @@ class TestExtractEmbeddingsArray:
 class TestEmbeddingCompileFallback:
     """Tests for embedding compile path fallback behavior."""
 
+    def test_load_repairs_synthetic_qwen3_vl_processor_multimodal_ids(self):
+        """Load should repair mlx-embeddings Qwen3-VL processors built via __new__."""
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        class InnerProcessor:
+            image_token_id = 151655
+            video_token_id = 151656
+
+        class WrappedProcessor:
+            def __init__(self):
+                self.processor = InnerProcessor()
+
+            def prepare_embedding_inputs(self, inputs, return_tensors="mlx"):
+                del inputs, return_tensors
+                return {}
+
+        mock_model = MagicMock()
+        mock_model.config.hidden_size = 4096
+        processor = WrappedProcessor()
+
+        model = MLXEmbeddingModel("test-model")
+        with patch("mlx_embeddings.load", return_value=(mock_model, processor)):
+            with patch.object(model, "_try_compile", return_value=False):
+                model.load()
+
+        assert processor.processor.image_ids == [151655]
+        assert processor.processor.video_ids == [151656]
+        assert processor.processor.audio_ids == [None]
+
     def test_compiled_path_fallback_on_failure(self):
         """Test that embed() falls back to eager when compiled path raises."""
         import mlx.core as mx
