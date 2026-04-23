@@ -1911,3 +1911,71 @@ class TestSerializeToolCallArguments:
 
     def test_non_dict_none_coerced_to_empty(self):
         assert _serialize_tool_call_arguments(None) == "{}"
+
+    def test_json_object_string_preserved(self, caplog):
+        """Spec-compliant JSON-object string (as OpenAI itself emits) must be
+        preserved, not silently dropped.
+
+        mlx-lm's json_tools parser just does `json.loads(text)` and returns
+        whatever shape the model emitted. When a model emits double-encoded
+        arguments (``"arguments": "{\\"path\\": ...}"``), the parser hands us
+        a str here — but it's a valid JSON object and round-trips cleanly.
+        Dropping it destroys real tool-call data.
+        """
+        raw = '{"path": "docs/plans/2026-04-22-omlx-config-implementation.md"}'
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            result = _serialize_tool_call_arguments(raw)
+        assert json.loads(result) == {
+            "path": "docs/plans/2026-04-22-omlx-config-implementation.md"
+        }
+        assert not any("non-dict" in r.message for r in caplog.records)
+
+    def test_json_object_string_preserves_unicode(self):
+        raw = '{"city": "서울"}'
+        result = _serialize_tool_call_arguments(raw)
+        assert json.loads(result) == {"city": "서울"}
+
+    def test_json_non_object_string_coerced(self, caplog):
+        """Strings that parse to JSON but not an object still coerce to {}."""
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            result = _serialize_tool_call_arguments("[1, 2, 3]")
+        assert result == "{}"
+        assert any("non-dict" in r.message for r in caplog.records)
+
+    def test_malformed_json_string_coerced(self, caplog):
+        """Unparseable strings still coerce to {} with a warning."""
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            result = _serialize_tool_call_arguments('{"path": ')
+        assert result == "{}"
+        assert any("non-dict" in r.message for r in caplog.records)
+
+
+class TestParseToolCallsStringifiedArguments:
+    """Regression for parser output where ``arguments`` arrives as a JSON
+    string (the shape mlx-lm's json_tools parser produces for spec-compliant
+    double-encoded OpenAI-style tool calls). The string must survive to
+    ToolCall.function.arguments, not be coerced to ``{}``.
+    """
+
+    def test_native_parser_returns_string_arguments(self):
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = lambda text, tools: {
+            "name": "Read",
+            "arguments": '{"path": "docs/plans/2026-04-22-omlx-config-implementation.md"}',
+        }
+
+        text = (
+            '<tool_call>{"name": "Read", "arguments": '
+            '"{\\"path\\": \\"docs/plans/2026-04-22-omlx-config-implementation.md\\"}"}'
+            "</tool_call>"
+        )
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "Read"
+        assert json.loads(tool_calls[0].function.arguments) == {
+            "path": "docs/plans/2026-04-22-omlx-config-implementation.md"
+        }

@@ -35,12 +35,28 @@ def _serialize_tool_call_arguments(arguments: Any) -> str:
 
     Chat templates for models with native tool calling (Qwen 3.5/3.6 XML,
     GLM, MiniMax) iterate `arguments.items()` when the call is echoed back
-    in history. Anything other than a dict must be coerced to "{}" here so
-    we never hand the client a non-JSON value that the next turn's template
-    would crash on.
+    in history, so whatever leaves here must parse back into a dict.
+
+    Accepts:
+    - dict: canonical case, serialized with ensure_ascii=False.
+    - str that parses to a JSON object: spec-compliant shape (OpenAI's
+      tool_call.arguments is itself a JSON-encoded string); mlx-lm's
+      json_tools parser returns these verbatim. Preserve them.
+
+    Anything else (bare strings, lists, numbers, None, or strings that
+    parse to non-object JSON) coerces to "{}" with a warning — the
+    arguments are unrecoverable but we must not hand the client a value
+    that crashes the next turn's template render.
     """
     if isinstance(arguments, dict):
         return json.dumps(arguments, ensure_ascii=False)
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments)
+        except (json.JSONDecodeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict):
+            return arguments
     logger.warning(
         "Tool parser returned non-dict arguments (type=%s, repr=%.200r); "
         "coercing to empty object to keep downstream template safe.",
