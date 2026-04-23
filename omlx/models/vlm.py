@@ -271,6 +271,33 @@ class VLMModelAdapter(nn.Module):
             return "mrope_section" in rope_cfg
         return False
 
+    @staticmethod
+    def _detect_complex_backbone(vlm_model) -> bool:
+        """Check if the text backbone is complex (MoE, etc.) and should skip decode model."""
+        config = getattr(vlm_model, "config", None)
+        if config is None:
+            return False
+        # Gemma-4 is a verified exception: mlx-lm's native ``gemma4`` wrapper
+        # preserves the checkpoint's quantized ``language_model.model.*``
+        # layout, so the decode-model weight-sharing path is safe again.
+        if getattr(config, "model_type", None) == "gemma4":
+            return False
+        text_config = getattr(config, "text_config", None)
+        if text_config is None:
+            return False
+
+        # MoE models (Gemma-4, Qwen2-MoE, etc.). `num_experts` is declared as
+        # `Optional[int] = None` on many configs (gemma4, qwen2_moe), so
+        # `getattr(..., 0)` returns None for dense variants — not 0 —
+        # which would crash `None > 0`. Coalesce to 0 before comparing.
+        if getattr(text_config, "enable_moe_block", False):
+            return True
+        num_experts = getattr(text_config, "num_experts", 0) or 0
+        if num_experts > 0:
+            return True
+
+        return False
+
     def clear_vlm_position_state(self) -> None:
         """Clear stale mRoPE position state from previous VLM requests.
 

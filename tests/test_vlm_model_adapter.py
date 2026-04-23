@@ -420,6 +420,99 @@ class TestMRoPEDetection:
         assert VLMModelAdapter._detect_mrope(vlm) is False
 
 
+class TestComplexBackboneDetection:
+    """Tests for _detect_complex_backbone — controls whether the mlx-lm
+    decode model build is skipped (routing decode through the VLM's own
+    language_model instead). Must correctly identify MoE text backbones
+    without crashing on dense configs where ``num_experts`` is declared
+    ``Optional[int] = None``.
+    """
+
+    def test_detects_moe_via_enable_moe_block(self):
+        """enable_moe_block=True should mark as complex."""
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = MagicMock(spec=[])
+        vlm.config = MagicMock(spec=[])
+        vlm.config.text_config = MagicMock(spec=[])
+        vlm.config.text_config.enable_moe_block = True
+        vlm.config.text_config.num_experts = None
+        assert VLMModelAdapter._detect_complex_backbone(vlm) is True
+
+    def test_detects_moe_via_num_experts(self):
+        """num_experts > 0 should mark as complex (gemma-4-26b-a4b: 128)."""
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = MagicMock(spec=[])
+        vlm.config = MagicMock(spec=[])
+        vlm.config.text_config = MagicMock(spec=[])
+        vlm.config.text_config.enable_moe_block = False
+        vlm.config.text_config.num_experts = 128
+        assert VLMModelAdapter._detect_complex_backbone(vlm) is True
+
+    def test_gemma4_moe_uses_decode_model_path(self):
+        """Gemma-4 is a verified exception: keep the decode-model fast path on.
+
+        oMLX now preserves mlx-lm's native `gemma4` wrapper, so the old
+        blanket MoE skip is no longer needed for this family. Other MoE
+        backbones still default to the conservative fallback until verified.
+        """
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = MagicMock(spec=[])
+        vlm.config = MagicMock(spec=[])
+        vlm.config.model_type = "gemma4"
+        vlm.config.text_config = MagicMock(spec=[])
+        vlm.config.text_config.enable_moe_block = True
+        vlm.config.text_config.num_experts = 128
+        assert VLMModelAdapter._detect_complex_backbone(vlm) is False
+
+    def test_dense_config_with_none_num_experts(self):
+        """Regression: dense gemma-4 configs declare ``num_experts: Optional[int] = None``.
+
+        A naive ``getattr(cfg, 'num_experts', 0) > 0`` raises
+        ``TypeError: '>' not supported between instances of 'NoneType' and 'int'``.
+        The guard must coalesce None to 0. Before the fix, this crash
+        was caught by ``VLMBatchedEngine``'s broader try/except and
+        silently bounced the model to the LLM engine (masking the bug).
+        """
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = MagicMock(spec=[])
+        vlm.config = MagicMock(spec=[])
+        vlm.config.text_config = MagicMock(spec=[])
+        vlm.config.text_config.enable_moe_block = False
+        vlm.config.text_config.num_experts = None  # the regression case
+        assert VLMModelAdapter._detect_complex_backbone(vlm) is False
+
+    def test_dense_config_with_zero_num_experts(self):
+        """num_experts=0 (dense) should return False."""
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = MagicMock(spec=[])
+        vlm.config = MagicMock(spec=[])
+        vlm.config.text_config = MagicMock(spec=[])
+        vlm.config.text_config.enable_moe_block = False
+        vlm.config.text_config.num_experts = 0
+        assert VLMModelAdapter._detect_complex_backbone(vlm) is False
+
+    def test_no_config(self):
+        """Missing config attribute should return False, not crash."""
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = MagicMock(spec=[])
+        assert VLMModelAdapter._detect_complex_backbone(vlm) is False
+
+    def test_no_text_config(self):
+        """Missing text_config should return False (e.g. flat LLM configs)."""
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = MagicMock(spec=[])
+        vlm.config = MagicMock(spec=[])
+        vlm.config.text_config = None
+        assert VLMModelAdapter._detect_complex_backbone(vlm) is False
+
+
 class TestCachedOffsetProxy:
     """Tests for _CachedOffsetProxy."""
 
@@ -673,6 +766,77 @@ class TestIntOffsetCacheProxy:
         assert proxy.offset == 625
         assert isinstance(proxy.offset, int)
 
+
+class TestResolveWeightSharePrefix:
+    """Tests for _resolve_weight_share_prefix — picks the right prefix to
+    bridge VLM language_model keys to mlx-lm's loaded model keys for the
+    zero-copy weight-sharing path in VLMBatchedEngine._build_decode_model.
+    Regression coverage for upstream jundot/omlx#582 which hardcoded
+    ``"language_model."`` and silently dropped all weights for gemma-4.
+    """
+
+    def test_gemma4_style_needs_no_prefix(self):
+        """VLM keys and mlx-lm keys both start with ``model.*`` → prefix=''."""
+        from omlx.engine.vlm import _resolve_weight_share_prefix
+
+        vlm_keys = [
+            "model.embed_tokens.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.norm.weight",
+        ]
+        lm_keys = [
+            "model.embed_tokens.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.norm.weight",
+        ]
+        assert _resolve_weight_share_prefix(vlm_keys, lm_keys) == ""
+
+    def test_qwen25_vl_style_needs_language_model_prefix(self):
+        """VLM keys ``model.*`` map to mlx-lm keys ``language_model.model.*``."""
+        from omlx.engine.vlm import _resolve_weight_share_prefix
+
+        vlm_keys = [
+            "model.embed_tokens.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+        ]
+        lm_keys = [
+            "language_model.model.embed_tokens.weight",
+            "language_model.model.layers.0.self_attn.q_proj.weight",
+            "language_model.lm_head.weight",
+        ]
+        assert _resolve_weight_share_prefix(vlm_keys, lm_keys) == "language_model."
+
+    def test_picks_longest_key_to_reduce_collisions(self):
+        """Algorithm must pick the longest VLM key to avoid suffix collisions.
+
+        A short key like ``lm_head.weight`` could suffix-match multiple
+        candidates; a deeply nested key like ``model.layers.29.experts.
+        switch_glu.down_proj.weight`` is far less likely to collide.
+        """
+        from omlx.engine.vlm import _resolve_weight_share_prefix
+
+        vlm_keys = [
+            "x.weight",  # short; could match many things
+            "model.layers.29.experts.switch_glu.down_proj.weight",  # long; specific
+        ]
+        lm_keys = [
+            "language_model.model.layers.29.experts.switch_glu.down_proj.weight",
+        ]
+        assert _resolve_weight_share_prefix(vlm_keys, lm_keys) == "language_model."
+
+    def test_falls_back_to_language_model_on_no_match(self):
+        """Unknown layout → fallback to legacy ``'language_model.'`` prefix."""
+        from omlx.engine.vlm import _resolve_weight_share_prefix
+
+        vlm_keys = ["model.embed_tokens.weight"]
+        lm_keys = ["completely.different.path.weight"]
+        assert _resolve_weight_share_prefix(vlm_keys, lm_keys) == "language_model."
+
+    def test_empty_vlm_keys_returns_empty_prefix(self):
+        """No VLM keys (degenerate case) → empty prefix, no crash."""
+        from omlx.engine.vlm import _resolve_weight_share_prefix
+
+        assert _resolve_weight_share_prefix([], ["model.weight"]) == ""
 
 
 class TestVlmAwareGetClasses:

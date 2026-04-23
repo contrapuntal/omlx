@@ -58,6 +58,36 @@ class _SkipDecodeModelBuild(Exception):
     """
 
 
+def _resolve_weight_share_prefix(vlm_keys, lm_keys) -> str:
+    """Find the prefix to prepend to VLM param keys so they match mlx-lm keys.
+
+    VLM language_model params come in as ``model.*`` (because we walk from
+    ``self._vlm_model.language_model`` which strips one level). mlx-lm's loaded
+    model may use ``model.*`` (gemma-4-text, e.g.) or ``language_model.model.*``
+    (Qwen2.5-VL-style). Picks the longest VLM key to minimize suffix collisions,
+    finds an lm_key that ends with it, returns the implied prefix. Falls back to
+    the legacy ``"language_model."`` when no lm_key matches — preserves old
+    behavior for architectures we haven't observed.
+
+    Args:
+        vlm_keys: iterable of VLM language_model parameter names
+            (e.g. ``model.embed_tokens.weight``).
+        lm_keys: iterable of mlx-lm model parameter names after ``load_model``.
+
+    Returns:
+        Prefix string, possibly empty. Used as ``prefix + vlm_key`` when
+        passing weights to ``lm_model.load_weights``.
+    """
+    vlm_keys = list(vlm_keys)
+    if not vlm_keys:
+        return ""
+    vlm_sample_key = max(vlm_keys, key=len)
+    for lm_key in lm_keys:
+        if lm_key.endswith(vlm_sample_key):
+            return lm_key[:-len(vlm_sample_key)]
+    return "language_model."
+
+
 # Text-backbone aliases for VLM configs whose ``text_config.model_type``
 # (or, for inline layouts like llava-qwen2, top-level ``model_type``) does
 # not match a module name under ``mlx_lm.models.*``.  Add entries only when
@@ -539,18 +569,22 @@ class VLMBatchedEngine(BaseEngine):
         self._lm_model = None
         # mRoPE VLMs (GLM-4.6V, Qwen3-VL, Qwen3.5-MoE-VL, etc.) route decode
         # through the VLM's own language_model to preserve per-request
-        # rope_deltas — see ``VLMModelAdapter.__call__`` and #689. Building
-        # an mlx-lm decode model would consume the slot and never be
-        # invoked; skip it upfront to avoid misleading "Model type X not
-        # supported" warnings and the associated startup work.
+        # rope_deltas — see ``VLMModelAdapter.__call__`` and #689.
+        #
+        # MoE models (Gemma-4, etc.) are skipped to avoid silent initialization
+        # instabilities and memory spikes during the decode model build.
         uses_mrope = VLMModelAdapter._detect_mrope(self._vlm_model)
-        if uses_mrope:
+        is_complex = VLMModelAdapter._detect_complex_backbone(self._vlm_model)
+
+        if uses_mrope or is_complex:
+            reason = "mRoPE" if uses_mrope else "Complex backbone (MoE)"
             logger.info(
-                "mRoPE VLM detected; skipping mlx-lm decode model build "
-                "(decode routes through VLM language_model; see #689)"
+                "%s VLM detected; skipping mlx-lm decode model build "
+                "(decode routes through VLM language_model)",
+                reason,
             )
         try:
-            if uses_mrope:
+            if uses_mrope or is_complex:
                 raise _SkipDecodeModelBuild()
             from pathlib import Path as _Path
 
@@ -579,12 +613,16 @@ class VLMBatchedEngine(BaseEngine):
                     get_model_classes=_vlm_aware_get_classes,
                 )
                 # Replace lazy weights with VLM's evaluated arrays by reference.
-                # VLM params "model.*" map to LM "language_model.model.*".
                 vlm_params = dict(tree_flatten(
                     self._vlm_model.language_model.parameters()
                 ))
+
+                # Robust key matching — see _resolve_weight_share_prefix docstring.
+                lm_keys = dict(tree_flatten(lm_model.parameters())).keys()
+                prefix = _resolve_weight_share_prefix(vlm_params.keys(), lm_keys)
+
                 lm_params = [
-                    ("language_model." + k, v) for k, v in vlm_params.items()
+                    (prefix + k, v) for k, v in vlm_params.items()
                 ]
                 lm_model.load_weights(lm_params, strict=False)
                 return lm_model
