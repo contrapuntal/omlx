@@ -415,3 +415,163 @@ requests to a VLM, which is what the sweep was using.  Two independent
 bugs, same outward symptom — the lesson is to verify a fix against the
 specific failure path the client is exercising, not infer coverage
 from "the server works now."
+
+---
+
+## Gemma-4 family Metal OOM via `_vlm_aware_get_classes` over-flattening
+
+- **First observed:** 2026-04-22 (gemma-4-26b-a4b-it-MLX-8bit crash loop on
+  any request; gemma-4-31b-it-MLX-8bit crashed at `ctx_size=8192`)
+- **Status:** **fixed in-tree** (`_VLM_NATIVE_TEXT_WRAPPERS` allowlist +
+  `_detect_complex_backbone` gemma-4 exemption). No upstream bug exists —
+  this was entirely a fork regression.
+- **Severity:** hard SIGABRT (`libc++abi` Metal command-buffer OOM) on
+  first inference after load, for the specific models above. For the MoE
+  variant (`num_experts=128`) the crash fires on any request; for the
+  dense 31B variant it needs a ctx_size that exposes the unbound
+  weights under decode. Process restarts via launchd; user sees HTTP
+  200 + mid-stream connection drop if request was already accepted.
+
+### Symptom
+
+```
+Loaded model: gemma-4-26b-a4b-it-MLX-8bit (estimated: 27.34GB, total: 27.34GB)
+libc++abi: terminating due to uncaught exception of type std::runtime_error:
+  [METAL] Command buffer execution failed: Insufficient Memory
+  (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)
+```
+
+Does NOT reproduce with bare mlx-vlm — a 30-line
+`mlx_vlm.utils.load(path) + language_model(input_ids)` script on the
+same model, venv, and hardware peaks at 26.04 GB and produces clean
+logits (see `scripts/debug_gemma4_oom.py`). That split cleanly
+isolated the bug to oMLX's engine path.
+
+### Root cause
+
+`_vlm_aware_get_classes` in `omlx/engine/vlm.py` (added in fork commit
+`b07f15a` "text-backbone alias resolver and LFM2.5 projector patch")
+unconditionally flattened VLM configs with a nested `text_config`:
+```python
+# before fix
+tc = config.get("text_config")
+if isinstance(tc, dict) and isinstance(tc.get("model_type"), str):
+    flat_model_type = tc["model_type"]  # → "gemma4_text" for gemma-4
+    for k, v in tc.items(): config[k] = v
+    config["model_type"] = flat_model_type
+```
+
+For **SmolVLM2 / GLM-4.6V / Qwen2.5-VL**, this is correct — mlx-lm has
+no top-level module matching the VLM's `model_type`, only the text
+backbone module. Flattening routes `load_model` to the right class.
+
+For **gemma-4**, mlx-lm ships `mlx_lm/models/gemma4.py` — the full VLM
+wrapper — AND `mlx_lm/models/gemma4_text.py` — a text-only module with
+*different quantization assumptions*. The checkpoint's weights are
+keyed at `language_model.model.*` (matching `gemma4.Model`) with a
+specific quantized layout. Flattening to `gemma4_text` picks the
+text-only class, whose `embed_tokens.weight` expects an unquantized
+shape `(vocab_size, hidden_size) = (262144, 2816)`. The zero-copy
+overlay then binds the checkpoint's packed 8-bit tensor of shape
+`(262144, 704)` into that slot by name. First forward hits
+`input_layernorm(x)` with `x.shape[-1] == 704` against a weight of
+shape `(2816,)` → `ValueError: [rms_norm] ...` → engine loop error.
+
+For the 26B MoE and 31B dense variants, the bug surfaces differently
+(hard SIGABRT on MoE, shape error on dense) because the MoE router
+runs extra dispatch work that pushes the unbound lazy weights through
+a path Metal's command buffer can't service.
+
+### Not the cause
+
+- **Not an upstream `47df15a` / PR #582 prefix bug.** The hardcoded
+  `"language_model." + k` prefix in upstream's `_build_decode_model` is
+  correct FOR upstream, where `load_model` uses mlx-lm's default class
+  resolver and lands on `gemma4.Model` (the full wrapper). The prefix
+  maps VLM's `model.*` onto mlx-lm's `language_model.model.*` exactly.
+  Earlier investigation in this repo (`scripts/verify_gemma4_fix_empirical.py`)
+  reported "0/687 slots bound under legacy prefix" — accurate as a
+  measurement, but measured against the wrong mlx-lm class
+  (`gemma4_text.Model` with 687 keys) that the buggy `_vlm_aware_get_classes`
+  was routing to. With the fix applied the same harness shows
+  "1339/1339 slots bound" against `gemma4.Model`.
+- **Not MoE-specific** in the architectural sense. Both 26B (MoE) and
+  31B (dense) gemma-4 variants hit the same root cause via different
+  dispatch paths. The `_detect_complex_backbone` MoE bypass added
+  during investigation was masking the 26B symptom without fixing the
+  underlying class misrouting. `_detect_complex_backbone` now exempts
+  gemma-4 explicitly (`config.model_type == "gemma4"` → `False`).
+- **Not a Metal wired-memory limit regression.** `iogpu.wired_limit_mb`
+  is 114688 MB (112 GB) on the test machine; 27 GB weights sit comfortably
+  under any plausible transient allocation. The Metal OOM was triggered
+  by a single dispatch requesting malformed scratch from bound-wrong
+  tensors, not by legitimate wired-memory pressure.
+- **Not today's mlx-vlm bump** (`1bf77424`). Reverting mlx-vlm to the
+  prior `3472132` pin reproduced the same crash; bug predates the bump.
+
+### A/B evidence
+
+Verification harness (`scripts/verify_gemma4_fix_empirical.py`) against
+the same `unsloth/gemma-4-26b-a4b-it-MLX-8bit` checkpoint, pre- and
+post-fix:
+
+| Phase | `_vlm_aware_get_classes` routes to | `lm_key_count` | Legacy `"language_model."` prefix binds | Inference |
+|---|---|---|---|---|
+| pre-fix | `gemma4_text.Model` (flattened) | 687 | 0/687 — shape mismatch on materialise | Metal OOM SIGABRT |
+| post-fix | `gemma4.Model` (wrapper preserved) | 1339 | 1339/1339 ✓ | clean prefill (1, N, 262144) + decode |
+
+Qwen2.5-VL-7B (control): 735/735 under legacy prefix in both phases —
+fix is a strict no-op for non-gemma-4 VLMs.
+
+### Local fix
+
+1. `omlx/engine/vlm.py` — added `_VLM_NATIVE_TEXT_WRAPPERS = {"gemma4"}`
+   allowlist and a `keep_wrapper` guard in `_vlm_aware_get_classes` that
+   skips the `text_config` flattening for those `model_type` values.
+   mlx-lm's top-level class is the correct decode-model target and the
+   quantization paths stay keyed against the wrapper's layout.
+2. `omlx/models/vlm.py` — `_detect_complex_backbone` short-circuits to
+   `False` when `config.model_type == "gemma4"` so the decode-model
+   fast path runs for gemma-4 MoE variants too (the MoE bypass was only
+   masking the class-routing bug).
+3. Module-level `_resolve_weight_share_prefix(vlm_keys, lm_keys)` helper
+   replaces the hardcoded `"language_model." + k` with a longest-key
+   suffix match. For gemma-4 and Qwen2.5-VL this still resolves to
+   `"language_model."` — pure defense-in-depth for hypothetical future
+   VLMs whose mlx-lm class structure requires a different prefix.
+
+Tests: `TestComplexBackboneDetection` (6), `TestResolveWeightSharePrefix`
+(5), `TestVlmAwareGetClasses::test_preserves_gemma4_wrapper_for_nested_text_config`
+— all green. Verification harness runs in
+`scripts/verify_gemma4_fix_empirical.py`.
+
+### When to remove this patch
+
+- Drop the `gemma4` entry from `_VLM_NATIVE_TEXT_WRAPPERS` if a future
+  mlx-lm release removes the top-level `gemma4` wrapper in favor of
+  `gemma4_text` alone — in that case re-verify that `gemma4_text` is
+  shape-compatible with the checkpoint layout before dropping the
+  allowlist.
+- The `_detect_complex_backbone` gemma-4 short-circuit can be removed
+  at the same time as the allowlist entry (it exists only because that
+  bypass was masking the class-routing bug during investigation).
+- `_resolve_weight_share_prefix` is independent — it stays as
+  defense-in-depth for hypothetical future VLMs.
+
+### Debugging note
+
+"Measured the right number, drew the wrong conclusion" failure mode.
+The verification harness correctly reported that only 0/687 mlx-lm
+parameter slots were bound under the legacy prefix, and I read that
+as "the prefix is wrong — upstream `47df15a` has a bug." What the
+number actually meant was "my harness is routing gemma-4 to a wrong
+mlx-lm class (687 keys) instead of the right one (1339 keys)." Had I
+questioned *why* the VLM side had ~2× as many keys as the mlx-lm side
+— a structural asymmetry with no innocent explanation — I would have
+caught the class-routing bug and spared the whole upstream-PR tangent.
+Parallel agent #4 came in without the anchoring bias of my "prefix
+bug" framing, asked "why does the structure differ at all?" and found
+the real cause in under an hour. Future bugs with similar geometry:
+when a weight-sharing count mismatches an expected 1:1 structural
+correspondence, suspect the target-class selection before suspecting
+the name-mapping.
