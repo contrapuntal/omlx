@@ -82,12 +82,34 @@ modelscope = [
     "modelscope>=1.10.0",
 ]
 audio = [
-    # mlx-audio from commit (5175326) with tts/stt/sts extras
+    # mlx-audio pinned to contrapuntal/mlx-audio fork-main, which is
+    # Blaizzy/mlx-audio main (HEAD a5867d7, 2026-04-23) plus two carry patches:
+    #   - voxtral-eos-token-ids-bypass: fixes Voxtral STT crash on tokenizer
+    #     `eos_token_ids` initialization (re-frames closed upstream PR #450)
+    #   - canary-mlx-converted-checkpoint-support: fixes silent half-decoder
+    #     load on MLX-converted canary checkpoints (alt key naming + already-
+    #     MLX conv layout heuristic)
     # tts extra: misaki, num2words, spacy, phonemizer-fork, espeakng-loader, sentencepiece
-    # stt extra: tiktoken, mistral-common[audio]
+    # stt extra: sentencepiece — upstream PR #673 stripped tiktoken and
+    #   mistral-common from [stt]; both are pinned directly below so the
+    #   implicit transitive contract no longer matters.
     # sts extra: tts deps + stt deps + webrtcvad
-    "mlx-audio[tts,stt,sts] @ git+https://github.com/Blaizzy/mlx-audio@51753266e0a4f766fd5e6fbc46652224efc23981",
+    "mlx-audio[tts,stt,sts] @ git+https://github.com/contrapuntal/mlx-audio@362228d8480d319cbaeb9c30aebb97fc628b9365",
     "python-multipart>=0.0.5",
+    # mistral-common[audio] is required by Voxtral STT (transformers' processing_voxtral.py
+    # imports `TranscriptionRequest` from it). mlx-audio PR #673 (Apr 23, 2026) silently
+    # removed this from the `[stt]` extra; pin it here so we don't depend on the upstream
+    # `[tts]` extra continuing to declare it. Floor is 1.11.0 because transformers
+    # 5.5.x imports `ReasoningEffort` from mistral_common which only exists from 1.11.
+    "mistral-common[audio]>=1.11.0",
+    # torch is required by Voxtral STT specifically: transformers' WhisperFeatureExtractor
+    # hardcodes `return_tensors='pt'` in its Voxtral processor. Other ASR/STT models in
+    # mlx-audio do not need torch. ~2GB.
+    "torch>=2.0.0",
+    # librosa is required by transformers' audio_utils.load_audio_as which Voxtral's
+    # processor calls. mlx-audio PR #662 (Apr 21, 2026) removed librosa from its own
+    # transitive deps; pin it here so Voxtral STT doesn't break when mlx-audio drops it.
+    "librosa>=0.10.0",
 ]
 dev = [
     "pytest>=7.0.0",
