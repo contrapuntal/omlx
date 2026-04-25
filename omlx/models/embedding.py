@@ -17,6 +17,8 @@ from typing import Any, Dict, List, Optional, Union
 import mlx.core as mx
 from mlx.utils import tree_flatten
 
+from ..utils.processor import repair_processor_multimodal_token_ids
+
 logger = logging.getLogger(__name__)
 
 
@@ -182,6 +184,7 @@ class MLXEmbeddingModel:
                 self.model_name,
                 tokenizer_config={"trust_remote_code": self.trust_remote_code},
             )
+            repair_processor_multimodal_token_ids(self.processor)
 
             if hasattr(self.model, "config"):
                 config = self.model.config

@@ -26,6 +26,7 @@ from ..model_discovery import (
     _is_causal_lm_reranker,
 )
 from ..utils.image import load_image
+from ..utils.processor import repair_processor_multimodal_token_ids
 
 logger = logging.getLogger(__name__)
 
@@ -185,10 +186,12 @@ class MLXRerankerModel:
         """
         from mlx_embeddings import load as mlx_emb_load
 
-        return mlx_emb_load(
+        model, processor = mlx_emb_load(
             str(self.model_name),
             tokenizer_config={"trust_remote_code": self.trust_remote_code},
         )
+        repair_processor_multimodal_token_ids(processor)
+        return model, processor
 
     def _build_vl_item(
         self, item: "str | dict[str, Any]"
