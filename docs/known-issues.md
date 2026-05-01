@@ -124,6 +124,62 @@ current sweep.*
 
 ---
 
+## `falcon_ocr` / `falcon_perception` — quantized models will produce uint32 logits
+
+- **First observed:** 2026-04-30 (latent-vulnerability scan during mlx-vlm
+  issue #1091 review)
+- **Status:** deferred; **not an oMLX bug** — upstream mlx-vlm code path,
+  no published quantized variant of either model exists yet. File upstream
+  PR if/when someone uploads a quantized falcon_ocr or falcon_perception.
+- **Severity:** any sampling pass on a quantized falcon_ocr / falcon_perception
+  language model will fail or silently produce garbage — `argmax` on uint32
+  logits returns valid token IDs but they're noise.
+
+### Symptom (predicted, no live repro)
+
+`falcon_ocr/language.py:434` and `falcon_perception/language.py:508` both
+do:
+
+```python
+logits = out.astype(self.model.embed_tokens.weight.dtype)
+```
+
+When `embed_tokens` is quantized, `weight.dtype` is `mx.uint32` (the packed
+storage container). The cast turns the float logits into uint32, which
+either crashes the next softmax/sampler call or — if the sampler tolerates
+integer input — produces token IDs sampled from quantized integer noise.
+
+### Root cause
+
+Same bug class as #1091 (and as PR #398 / gemma3n before it). The dtype
+oracle `embed_tokens.weight.dtype` happens to equal the model's compute
+dtype on unquantized models but is `uint32` on quantized ones. In the VLM
+issue (#1091 / our PR) the cast was applied to pixel values; here it's
+applied to logits, with the same underlying mistake.
+
+### Why it's not in the current PR (#1091 fix)
+
+R2 of our pre-submission review caught it; both reviewers explicitly
+recommended keeping it out of the MiniCPM-o/FastVLM PR to keep that scope
+focused on the reported bug. No published quantized falcon_ocr or
+falcon_perception MLX variant exists on `mlx-community`, so the bug is
+purely latent.
+
+### Fix shape (when ready)
+
+Source the dtype from a non-quantized layer — e.g., the model's compute
+dtype tracked elsewhere, or `out.dtype` itself (if `out` is already in the
+right float). Both files have only one occurrence each, so a tiny
+focused PR mirrors the structure of our current MiniCPM-o/FastVLM fix.
+
+### Upstream reference
+
+- `mlx_vlm/models/falcon_ocr/language.py:434`
+- `mlx_vlm/models/falcon_perception/language.py:508`
+- Sibling fix landed in our PR for #1091 (MiniCPM-o + FastVLM, pixel cast variant)
+
+---
+
 ## SmolVLM2 + schema-less `response_format: json_object` — 4000-token runaway, invalid JSON
 
 - **First observed:** 2026-04-20
