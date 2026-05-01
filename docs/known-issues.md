@@ -180,6 +180,81 @@ focused PR mirrors the structure of our current MiniCPM-o/FastVLM fix.
 
 ---
 
+## `apple/FastVLM-7B` — load fails on stock mlx-vlm; tied-only forward pass would silently corrupt outputs even if load were patched
+
+- **First observed:** 2026-04-30 (during MLX FastVLM tier build for oMLX)
+- **Status:** **fixed locally** on `contrapuntal/mlx-vlm@fix/fastvlm-untied-lm-head` (commit `10f139e`); HOLDING — push + upstream PR after `Blaizzy/mlx-vlm#1098` merges. oMLX runtime pin (`pyproject.toml`, `e41cd25`) unchanged for now.
+- **Severity:** any attempt to convert or load `apple/FastVLM-7B` (or any FastVLM variant with `tie_word_embeddings: false`) through stock mlx-vlm fails at load. If only the load were patched, outputs would be silently wrong because the forward pass always uses the tied path even when an untied `lm_head` exists.
+
+### Symptom
+
+`mlx_vlm convert --hf-path apple/FastVLM-7B --mlx-path X --dtype bfloat16 --trust-remote-code` raises during the load phase:
+
+```
+File ".../mlx_vlm/utils.py", line 336, in load_model
+    model.load_weights(list(weights.items()))
+File ".../mlx/nn/layers/base.py", line 185, in load_weights
+    raise ValueError(...)
+ValueError: Received 1 parameters not in model:
+lm_head.weight.
+```
+
+`apple/FastVLM-0.5B` and `apple/FastVLM-1.5B` are unaffected — both ship with `tie_word_embeddings: true` and have no separate `lm_head.weight` in the safetensors.
+
+### Root cause (two interlocking bugs)
+
+1. **Load-time prefix bug** — `mlx_vlm/models/fastvlm/fastvlm.py:215-216` short-circuits on any `lm_head` key in `Model.sanitize`:
+
+   ```python
+   if "lm_head" in key:
+       return key
+   ```
+
+   The fall-through line below would otherwise add the `language_model.` prefix that the FastVLM `Model` hierarchy expects. Without the prefix, `model.load_weights` sees an unknown key and raises.
+
+2. **Tied-only forward pass** — `mlx_vlm/models/fastvlm/language.py:30` unconditionally projects via the embedding matrix:
+
+   ```python
+   out = self.model.embed_tokens.as_linear(out)
+   ```
+
+   No `if self.config.tie_word_embeddings: ... else: out = self.lm_head(out)` branch (canonical pattern in `qwen2_vl/language.py:531-534` and `qwen2_5_vl/language.py:539-542`). Even if bug #1 were patched in isolation, the loaded `lm_head.weight` would remain dead and the model would compute the output projection from a weight matrix it was not trained against.
+
+The combination of #1 + #2 means **no one has ever successfully run `apple/FastVLM-7B` through stock mlx-vlm.** Existing community uploads of MLX-quantized 7B FastVLM (e.g. `InsightKeeper/FastVLM-7B-MLX-{4,6,8}bit`) either patched their conversion locally and the resulting MLX checkpoints inherit a similar load-time fragility, or they "load" only because the conversion silently dropped `lm_head.weight` and they produce wrong outputs via the tied path.
+
+### Live repro / fix verification
+
+| | Stock `mlx-vlm@main` (or pinned `e41cd25`) | `fix/fastvlm-untied-lm-head` (commit `10f139e`) |
+|---|---|---|
+| Convert `apple/FastVLM-7B` → bf16 | ❌ raises at load | ✅ writes 15 GB to `/Volumes/MacExternalStorage/models/vlm/FastVLM-7B-bf16/` |
+| Vision generation on the resulting bf16 model | n/a | ✅ `"A white airplane with blue stripes and a blue tail fin..."` (~1.2 s, M-series) |
+| Convert + run `apple/FastVLM-0.5B` and `apple/FastVLM-1.5B` (tied) | ✅ works | ✅ unchanged (non-regression verified) |
+
+### Fix shape
+
+Two-file diff (`mlx_vlm/models/fastvlm/fastvlm.py` + `mlx_vlm/models/fastvlm/language.py`), 8 +/4 −:
+
+- Drop the `lm_head` short-circuit in `Model.sanitize` so `language_model.` is prepended to `lm_head.weight` like every other top-level weight.
+- Gate the forward-pass projection on `self.config.tie_word_embeddings`, mirroring `qwen2_vl` / `qwen2_5_vl`.
+- Update `LanguageModel.sanitize` to pop the prefixed key (`language_model.lm_head.weight`) since `Model.sanitize` runs first in `utils.py:252-269`.
+
+### When to update oMLX
+
+After **both** `Blaizzy/mlx-vlm#1098` (pixel cast on quantized LMs) and the held FastVLM-untied PR (one-line bump from `10f139e`) merge upstream, bump the `mlx-vlm` pin in `pyproject.toml` past both commits. Until then:
+
+- `/Volumes/MacExternalStorage/models/vlm/FastVLM-7B-bf16/` is loadable only via the `fix/fastvlm-untied-lm-head` worktree at `/Volumes/MacExternalStorage/proj/mlx-vlm-fastvlm-untied/`.
+- `/Volumes/MacExternalStorage/models/vlm/FastVLM-1.5B-8bit/` is loadable only via the `fix/quantized-vlm-pixel-dtype-cast` worktree (`/Volumes/MacExternalStorage/proj/mlx-vlm-fix-pixel-dtype/`) since it depends on #1098's pixel-cast fix.
+- `/Volumes/MacExternalStorage/models/vlm/FastVLM-0.5B-bf16/` works via the runtime pin today (tied + bf16, hits neither bug).
+
+### Upstream reference
+
+- `mlx_vlm/models/fastvlm/fastvlm.py:215-216` and `mlx_vlm/models/fastvlm/language.py:30,33-38` — bug sites
+- `mlx_vlm/models/qwen2_vl/language.py:265-266,531-534` — canonical untied pattern this fix mirrors
+- `Blaizzy/mlx-vlm#639` — original FastVLM addition; untied path was never exercised by the test plan
+- `Blaizzy/mlx-vlm#1098` (open, our PR) — sibling bug class (pixel cast on quantized LMs) that 1.5B-8bit FastVLM separately depends on
+
+---
+
 ## SmolVLM2 + schema-less `response_format: json_object` — 4000-token runaway, invalid JSON
 
 - **First observed:** 2026-04-20
