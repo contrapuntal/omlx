@@ -133,4 +133,4 @@ clusterPlan.md
 # Personal / machine-specific (not for upstream)
 docs/local-machine.md
 packaging/launchd/
-.fork-sync
+.sync-fork-main.cfg
