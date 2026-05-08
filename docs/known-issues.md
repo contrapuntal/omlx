@@ -183,7 +183,7 @@ focused PR mirrors the structure of our current MiniCPM-o/FastVLM fix.
 ## `apple/FastVLM-7B` — load fails on stock mlx-vlm; tied-only forward pass would silently corrupt outputs even if load were patched
 
 - **First observed:** 2026-04-30 (during MLX FastVLM tier build for oMLX)
-- **Status:** **fixed locally** on `contrapuntal/mlx-vlm@fix/fastvlm-untied-lm-head` (commit `10f139e`); HOLDING — push + upstream PR after `Blaizzy/mlx-vlm#1098` merges. oMLX runtime pin (`pyproject.toml`, `e41cd25`) unchanged for now.
+- **Status:** **fixed locally** on `contrapuntal/mlx-vlm@fix/fastvlm-untied-lm-head` (commit `10f139e`); HOLDING — push + upstream PR after `Blaizzy/mlx-vlm#1098` merges. oMLX runtime pin bumped to `19e563d` on 2026-05-07 (mlx-vlm sync); both FastVLM bugs (sanitize short-circuit + unconditional tied projection) and `#1098` are still unfixed upstream at that commit.
 - **Severity:** any attempt to convert or load `apple/FastVLM-7B` (or any FastVLM variant with `tie_word_embeddings: false`) through stock mlx-vlm fails at load. If only the load were patched, outputs would be silently wrong because the forward pass always uses the tied path even when an untied `lm_head` exists.
 
 ### Symptom
@@ -224,7 +224,7 @@ The combination of #1 + #2 means **no one has ever successfully run `apple/FastV
 
 ### Live repro / fix verification
 
-| | Stock `mlx-vlm@main` (or pinned `e41cd25`) | `fix/fastvlm-untied-lm-head` (commit `10f139e`) |
+| | Stock `mlx-vlm@main` (or pinned `19e563d`) | `fix/fastvlm-untied-lm-head` (commit `10f139e`) |
 |---|---|---|
 | Convert `apple/FastVLM-7B` → bf16 | ❌ raises at load | ✅ writes 15 GB to `/Volumes/MacExternalStorage/models/vlm/FastVLM-7B-bf16/` |
 | Vision generation on the resulting bf16 model | n/a | ✅ `"A white airplane with blue stripes and a blue tail fin..."` (~1.2 s, M-series) |
