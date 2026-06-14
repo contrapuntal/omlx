@@ -2076,3 +2076,183 @@ class TestDeclaredPoolingMode:
 
         out = np.array(m.embed(["ab", "abc"]).embeddings)
         assert np.allclose(out, self._E2E_EXPECTED, atol=1e-5)
+
+
+class TestLengthBucketedBatching:
+    """Length-aware embedding batch planning (OOM ceiling + padding speed)."""
+
+    def _plan(self, *args, **kwargs):
+        from omlx.engine.embedding import _plan_length_bucketed_batches
+
+        return _plan_length_bucketed_batches(*args, **kwargs)
+
+    def test_empty(self):
+        assert self._plan([], max_items=32, max_mask_elements=10**9) == []
+
+    def test_covers_all_indices_exactly_once(self):
+        lengths = [5, 1, 9, 3, 7, 2]
+        batches = self._plan(lengths, max_items=2, max_mask_elements=10**12)
+        flat = sorted(i for b in batches for i in b)
+        assert flat == list(range(len(lengths)))
+
+    def test_sorts_by_length_within_plan(self):
+        # Each batch's members should be contiguous in length order.
+        lengths = [100, 1, 50, 2, 99]
+        batches = self._plan(lengths, max_items=2, max_mask_elements=10**12)
+        ordered = [i for b in batches for i in b]
+        assert [lengths[i] for i in ordered] == sorted(lengths)
+
+    def test_respects_item_cap(self):
+        lengths = [1] * 10
+        batches = self._plan(lengths, max_items=3, max_mask_elements=10**12)
+        assert all(len(b) <= 3 for b in batches)
+        assert sum(len(b) for b in batches) == 10
+
+    def test_mask_cap_splits_long_inputs_into_smaller_batches(self):
+        # All same long length L; budget allows only k = floor(max/L^2) per batch.
+        L = 1000
+        lengths = [L] * 9
+        max_mask = 3 * L * L  # exactly room for 3 per batch
+        batches = self._plan(lengths, max_items=32, max_mask_elements=max_mask)
+        assert all(len(b) * L * L <= max_mask for b in batches)
+        assert max(len(b) for b in batches) == 3
+
+    def test_single_over_budget_item_is_isolated(self):
+        lengths = [10, 10, 50000]  # last alone exceeds the tiny budget
+        batches = self._plan(lengths, max_items=32, max_mask_elements=1000)
+        # the huge one must be in a batch by itself
+        huge = [b for b in batches if 2 in b][0]
+        assert huge == [2]
+
+    def test_short_inputs_pack_into_full_batches(self):
+        lengths = [10] * 64
+        # generous mask budget -> only item cap matters
+        batches = self._plan(lengths, max_items=32, max_mask_elements=10**12)
+        assert [len(b) for b in batches] == [32, 32]
+
+
+class TestEmbeddingEngineOrdering:
+    """Engine preserves input order and completeness across bucketed batches."""
+
+    def _engine(self, batch_size, max_mask_elements=10**12):
+        from types import SimpleNamespace
+        from omlx.engine.embedding import EmbeddingEngine
+
+        cfg = SimpleNamespace(
+            embedding_batch_size=batch_size,
+            embedding_max_mask_elements=max_mask_elements,
+        )
+        return EmbeddingEngine("test-model", scheduler_config=cfg)
+
+    def test_embed_preserves_original_order(self):
+        import asyncio
+        from unittest.mock import MagicMock, patch
+        from omlx.models.embedding import EmbeddingOutput
+
+        # Varying-length texts; embedding encodes the text length so we can
+        # verify each output lands at its original index after bucketing.
+        texts = ["a" * n for n in [4, 1, 7, 2, 9, 3, 6, 5]]
+
+        engine = self._engine(batch_size=2)
+        with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel:
+            model = MagicMock()
+            model.measure_lengths.side_effect = (
+                lambda inputs, max_length, truncation: [len(t) for t in inputs]
+            )
+
+            def fake_embed(inputs, max_length, padding, truncation):
+                return EmbeddingOutput(
+                    embeddings=[[float(len(t))] for t in inputs],
+                    total_tokens=sum(len(t) for t in inputs),
+                    dimensions=1,
+                )
+
+            model.embed.side_effect = fake_embed
+            MockModel.return_value = model
+
+            asyncio.run(engine.start())
+            result = asyncio.run(engine.embed(texts))
+
+        model.measure_lengths.assert_called()  # length-aware path was used
+        assert result.embeddings == [[float(len(t))] for t in texts]
+        assert result.total_tokens == sum(len(t) for t in texts)
+        assert result.dimensions == 1
+
+    def test_embed_falls_back_when_measure_lengths_unavailable(self):
+        import asyncio
+        from unittest.mock import MagicMock, patch
+        from omlx.models.embedding import EmbeddingOutput
+
+        engine = self._engine(batch_size=2)
+        with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel:
+            model = MagicMock()
+            model.measure_lengths.side_effect = RuntimeError("no tokenizer")
+
+            def fake_embed(inputs, max_length, padding, truncation):
+                return EmbeddingOutput(
+                    embeddings=[[float(len(t))] for t in inputs],
+                    total_tokens=0,
+                    dimensions=1,
+                )
+
+            model.embed.side_effect = fake_embed
+            MockModel.return_value = model
+
+            asyncio.run(engine.start())
+            result = asyncio.run(engine.embed(["aaaa", "a", "aaaaaaa"]))
+
+        assert result.embeddings == [[4.0], [1.0], [7.0]]
+
+
+class TestEmbeddingEngineReviewFixes:
+    """Regression guards for Codex review of length-bucketed batching."""
+
+    def test_row_count_mismatch_raises(self):
+        import asyncio
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock, patch
+        from omlx.engine.embedding import EmbeddingEngine
+        from omlx.models.embedding import EmbeddingOutput
+
+        cfg = SimpleNamespace(embedding_batch_size=8, embedding_max_mask_elements=10**12)
+        engine = EmbeddingEngine("test-model", scheduler_config=cfg)
+        with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel:
+            model = MagicMock()
+            model.measure_lengths.side_effect = (
+                lambda inputs, max_length, truncation: [len(t) for t in inputs]
+            )
+            # returns ONE vector for a two-item batch -> must not be silently dropped
+            model.embed.return_value = EmbeddingOutput(
+                embeddings=[[0.1]], total_tokens=2, dimensions=1
+            )
+            MockModel.return_value = model
+            asyncio.run(engine.start())
+            with pytest.raises(RuntimeError, match="returned 1 vectors"):
+                asyncio.run(engine.embed(["aa", "bb"]))
+
+    def test_measure_lengths_byte_upper_bound_on_fallback(self):
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        m = MLXEmbeddingModel("x")
+        m.processor = object()  # not callable, no .encode -> fallback path
+        # multibyte char: 1 Python char but 3 UTF-8 bytes -> byte count is the
+        # safe (>= token) estimate, never the 1-char under-count.
+        lengths = m.measure_lengths(["世"], max_length=512, truncation=True)
+        assert lengths == [len("世".encode("utf-8"))] == [3]
+
+    def test_measure_lengths_skips_custom_embedding_processors(self):
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        m = MLXEmbeddingModel("x")
+        m.processor = MagicMock()
+        with patch.object(
+            MLXEmbeddingModel, "_uses_custom_embedding_inputs", return_value=True
+        ):
+            assert m.measure_lengths(["a", "b"], max_length=512) == []
+
+    def test_settings_wires_mask_budget(self):
+        from omlx.settings import SchedulerSettings
+
+        s = SchedulerSettings.from_dict({"embedding_max_mask_elements": 12345})
+        assert s.embedding_max_mask_elements == 12345
+        assert SchedulerSettings().embedding_max_mask_elements == 2_000_000_000
