@@ -281,6 +281,10 @@ class SchedulerSettings:
 
     max_concurrent_requests: int = 8
     embedding_batch_size: int = 32
+    # Cap on the per-forward embedding attention-mask size (items * seq^2).
+    # Bounds memory for length-bucketed batches so one long input can't OOM.
+    # Lower it if large models are co-resident; 0 disables the cap.
+    embedding_max_mask_elements: int = 2_000_000_000
     # When True, long prefills are interleaved with decode steps.
     # Reduces TTFT for concurrent requests at the cost of per-step overhead.
     chunked_prefill: bool = False
@@ -318,6 +322,9 @@ class SchedulerSettings:
         return cls(
             max_concurrent_requests=value,
             embedding_batch_size=embedding_batch_size,
+            embedding_max_mask_elements=data.get(
+                "embedding_max_mask_elements", 2_000_000_000
+            ),
             chunked_prefill=bool(data.get("chunked_prefill", False)),
             prefill_priority=prefill_priority,
             decode_fairness=bool(data.get("decode_fairness", True)),
@@ -1123,6 +1130,13 @@ class GlobalSettings:
                 logger.warning(
                     f"Invalid OMLX_EMBEDDING_BATCH_SIZE value: {embedding_batch_size}"
                 )
+        if mask_elems := os.getenv("OMLX_EMBEDDING_MAX_MASK_ELEMENTS"):
+            try:
+                self.scheduler.embedding_max_mask_elements = int(mask_elems)
+            except ValueError:
+                logger.warning(
+                    f"Invalid OMLX_EMBEDDING_MAX_MASK_ELEMENTS value: {mask_elems}"
+                )
 
         # Cache settings
         if cache_enabled := os.getenv("OMLX_CACHE_ENABLED"):
@@ -1711,6 +1725,7 @@ class GlobalSettings:
             max_num_seqs=self.scheduler.max_concurrent_requests,
             completion_batch_size=self.scheduler.max_concurrent_requests,
             embedding_batch_size=self.scheduler.embedding_batch_size,
+            embedding_max_mask_elements=self.scheduler.embedding_max_mask_elements,
             chunked_prefill=self.scheduler.chunked_prefill,
             prefill_speed_priority=(self.scheduler.prefill_priority == "speed"),
             decode_fairness=self.scheduler.decode_fairness,

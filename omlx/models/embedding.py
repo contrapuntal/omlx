@@ -974,6 +974,75 @@ class MLXEmbeddingModel:
             return int(len(input_ids))
         return 0
 
+    def measure_lengths(
+        self,
+        inputs: Union[str, List[str], List[Dict[str, str]]],
+        max_length: int,
+        truncation: bool = True,
+    ) -> List[int]:
+        """Return the post-truncation token length of each input.
+
+        Used by the engine to group similar-length inputs and bound the
+        per-batch attention-mask size. Never raises: if tokenization is
+        unavailable it falls back to a character count, which is an upper bound
+        on the token count (so batches stay conservatively small, never under).
+        """
+        normalized = self._normalize_embedding_inputs(inputs)
+        texts = [item.get("text", "") for item in normalized]
+        if not texts:
+            return []
+
+        # Custom/multimodal embedding processors (e.g. qwen3_vl) route structured
+        # inputs through prepare_embedding_inputs and add image/chat-template tokens
+        # this text-only count would miss. Return empty so the engine falls back to
+        # fixed-size batching rather than under-counting and over-packing a batch.
+        if self._uses_custom_embedding_inputs(self.processor):
+            return []
+
+        cap = max_length if (truncation and max_length) else None
+
+        tokenizer = self.processor
+        if hasattr(tokenizer, "_tokenizer") and not self._uses_custom_embedding_inputs(
+            tokenizer
+        ):
+            tokenizer = tokenizer._tokenizer
+
+        # Fast path: a single batched, unpadded tokenizer call.
+        if callable(tokenizer):
+            try:
+                encoded = tokenizer(
+                    texts,
+                    padding=False,
+                    truncation=bool(truncation),
+                    max_length=max_length,
+                    add_special_tokens=True,
+                )
+                rows = encoded["input_ids"]
+                return [max(1, len(row)) for row in rows]
+            except Exception:
+                pass
+
+        # Per-item fallback: tokenizer.encode, else a character-count estimate.
+        encode = getattr(tokenizer, "encode", None)
+        lengths: List[int] = []
+        for text in texts:
+            n: Optional[int] = None
+            if callable(encode):
+                try:
+                    toks = encode(text, add_special_tokens=True)
+                    n = len(toks.ids) if hasattr(toks, "ids") else len(toks)
+                except Exception:
+                    n = None
+            if n is None:
+                # UTF-8 byte count is a safe upper bound on token count for
+                # byte-level BPE (a multibyte char can split into several tokens,
+                # so a Python char count would under-estimate and risk OOM).
+                n = len(text.encode("utf-8"))
+            if cap is not None:
+                n = min(n, cap)
+            lengths.append(max(1, n))
+        return lengths
+
     @property
     def hidden_size(self) -> Optional[int]:
         """Get the embedding dimension."""

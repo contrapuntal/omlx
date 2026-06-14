@@ -1533,6 +1533,13 @@ class SchedulerConfig:
     completion_batch_size: int = 32
     # Per-forward embedding input chunk size
     embedding_batch_size: int = 32
+    # Upper bound on the dense attention-mask size (in elements: items * seq^2)
+    # the embedding engine builds per forward. With length-bucketed batching this
+    # caps memory so one long input cannot pad a whole batch up to the model's
+    # context and OOM Metal. ~2e9 elems ≈ 4 GiB (bf16) / 8 GiB (f32) mask, well
+    # under Metal's per-buffer limit. Set to 0 to disable the mask cap (fixed-size
+    # batching by item count only).
+    embedding_max_mask_elements: int = 2_000_000_000
     prefill_step_size: int = 2048
     # When True, long prefills are processed one chunk per step() call,
     # interleaved with decode steps for already-running requests. This
