@@ -321,26 +321,90 @@ class MLXRerankerModel:
                 "This model may not be a compatible CausalLM reranker."
             )
 
-        # Pre-compute prefix and suffix tokens for the prompt template.
-        # Use apply_chat_template() for portability across tokenizer formats,
-        # then split on a sentinel to extract prefix/suffix boundaries.
+        # Pre-compute the static prompt prefix/suffix (the document content is
+        # spliced between them at scoring time). The Qwen3-Reranker frame opens a
+        # user turn, then prefills an empty think block before the yes/no logit:
+        #   prefix = "<|im_start|>system\n{SYS}<|im_end|>\n<|im_start|>user\n"
+        #   suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        # We first try to recover the frame from the tokenizer's chat template, so
+        # a model shipping its own system prompt or framing is honored. We fall
+        # back to the built-in Qwen frame only when the template cannot provide it
+        # (absent, unrenderable, or role-specific templates that drop the user
+        # content, as shipped by MLX-converted Qwen3-Reranker repos).
         _SENTINEL = "<<__CONTENT_SENTINEL__>>"
-        messages = [
-            {"role": "system", "content": self._CAUSAL_LM_SYSTEM_PROMPT},
-            {"role": "user", "content": _SENTINEL},
-        ]
-        template_str = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        parts = template_str.split(_SENTINEL)
-        if len(parts) != 2:
-            raise ValueError(
-                f"Chat template produced unexpected format; "
-                f"could not split on sentinel. Template: {template_str!r}"
+        _THINK_PREFILL = "<think>\n\n</think>\n\n"
+
+        prefix = suffix = None
+        if getattr(tokenizer, "chat_template", None):
+            messages = [
+                {"role": "system", "content": self._CAUSAL_LM_SYSTEM_PROMPT},
+                {"role": "user", "content": _SENTINEL},
+            ]
+            try:
+                template_str = tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+            except (MemoryError, RecursionError):
+                raise
+            except Exception as e:
+                logger.warning(
+                    "Could not render the CausalLM reranker chat template for %s; "
+                    "falling back to the built-in scoring prompt: %s",
+                    self.model_name,
+                    e,
+                )
+                template_str = None
+
+            if template_str is not None:
+                head, sentinel, tail = template_str.partition(_SENTINEL)
+                if sentinel:
+                    prefix = head
+                    # Some chat templates already emit the empty-think prefill via
+                    # add_generation_prompt; only append it when the exact prefill
+                    # is absent. Matching the full sequence (not just "</think>")
+                    # avoids both a duplicated prefill and a doubled opening tag
+                    # when a template emits only "<think>\n".
+                    suffix = tail if _THINK_PREFILL in tail else tail + _THINK_PREFILL
+                else:
+                    logger.warning(
+                        "CausalLM reranker chat template for %s did not preserve "
+                        "user content; falling back to the built-in scoring prompt.",
+                        self.model_name,
+                    )
+
+        if prefix is None or suffix is None:
+            # The built-in fallback frame is Qwen3-Reranker specific. Other CausalLM
+            # reranker architectures must surface a clear error rather than be scored
+            # through a frame that does not match their tokenizer. When adding a new
+            # arch to CAUSAL_LM_RERANKER_ARCHITECTURES that needs a built-in frame,
+            # extend this gate together with its fallback.
+            arch = self._get_architecture()
+            if arch != "Qwen3ForCausalLM":
+                raise ValueError(
+                    f"CausalLM reranker {self.model_name} has no usable chat "
+                    f"template, and no built-in scoring frame exists for "
+                    f"architecture {arch!r}. Only Qwen3-Reranker models have a "
+                    "built-in fallback frame."
+                )
+            prefix = (
+                f"<|im_start|>system\n{self._CAUSAL_LM_SYSTEM_PROMPT}<|im_end|>\n"
+                "<|im_start|>user\n"
             )
-        prefix = parts[0]
-        # Append <think> block for models that use thinking-then-answering format
-        suffix = parts[1] + "<think>\n\n</think>\n\n"
+            suffix = f"<|im_end|>\n<|im_start|>assistant\n{_THINK_PREFILL}"
+
+        # The scoring frame relies on ChatML control tokens. If the tokenizer does
+        # not map them to dedicated ids, they are silently split into ordinary text,
+        # producing a prompt that loads but scores incorrectly. Fail loudly instead.
+        for marker in ("<|im_start|>", "<|im_end|>"):
+            if marker in prefix or marker in suffix:
+                marker_ids = tokenizer.encode(marker, add_special_tokens=False)
+                if len(marker_ids) != 1:
+                    raise ValueError(
+                        f"Tokenizer for {self.model_name} does not map ChatML "
+                        f"control token {marker!r} to a single id (got "
+                        f"{marker_ids}); its tokenizer is incompatible with the "
+                        "CausalLM reranker scoring frame."
+                    )
 
         self._prefix_tokens = tokenizer.encode(prefix, add_special_tokens=False)
         self._suffix_tokens = tokenizer.encode(suffix, add_special_tokens=False)

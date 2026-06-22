@@ -2,6 +2,9 @@
 """Tests for CausalLM-based reranker support."""
 
 import json
+import sys
+from contextlib import ExitStack
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -10,6 +13,7 @@ from safetensors.numpy import save_file
 
 try:
     import mlx.core as mx
+
     HAS_MLX = True
 except ImportError:
     HAS_MLX = False
@@ -61,16 +65,191 @@ class TestXLMRobertaReranker:
 class TestCausalLMReranker:
     """Tests for CausalLM reranker (e.g., Qwen3-Reranker) functionality."""
 
-    def _make_model_dir(self, tmp_path, name="Qwen3-Reranker-0.6B"):
+    def _make_model_dir(
+        self,
+        tmp_path,
+        name="Qwen3-Reranker-0.6B",
+        architecture="Qwen3ForCausalLM",
+        model_type="qwen3",
+    ):
         """Create a mock model directory with CausalLM reranker config."""
         model_dir = tmp_path / name
         model_dir.mkdir()
         config = {
-            "model_type": "qwen3",
-            "architectures": ["Qwen3ForCausalLM"],
+            "model_type": model_type,
+            "architectures": [architecture],
         }
         (model_dir / "config.json").write_text(json.dumps(config))
         return model_dir
+
+    def _load_with_tokenizer(self, tmp_path, tokenizer, **model_dir_kwargs):
+        model_dir = self._make_model_dir(tmp_path, **model_dir_kwargs)
+        model = MLXRerankerModel(str(model_dir))
+        wrapper = SimpleNamespace(_tokenizer=tokenizer)
+        fake_mlx_lm = SimpleNamespace(
+            load=MagicMock(return_value=(MagicMock(), wrapper))
+        )
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch(
+                    "omlx.utils.model_loading.maybe_load_custom_quantization",
+                    return_value=None,
+                )
+            )
+            stack.enter_context(patch.dict(sys.modules, {"mlx_lm": fake_mlx_lm}))
+            model._load_causal_lm()
+
+        return model
+
+    def _make_causal_tokenizer(self):
+        tokenizer = MagicMock()
+        tokenizer.convert_tokens_to_ids.side_effect = {"yes": 1, "no": 2}.get
+        tokenizer.encode.side_effect = lambda text, add_special_tokens=False: [text]
+        return tokenizer
+
+    def test_load_causal_lm_preserves_echoing_chat_template(self, tmp_path):
+        tokenizer = self._make_causal_tokenizer()
+        sentinel = "<<__CONTENT_SENTINEL__>>"
+        tokenizer.apply_chat_template.return_value = f"prefix{sentinel}suffix"
+
+        model = self._load_with_tokenizer(tmp_path, tokenizer)
+
+        assert model._prefix_tokens == ["prefix"]
+        assert model._suffix_tokens == ["suffix<think>\n\n</think>\n\n"]
+
+    def test_load_causal_lm_falls_back_when_template_transforms_content(self, tmp_path):
+        tokenizer = self._make_causal_tokenizer()
+        tokenizer.apply_chat_template.return_value = (
+            "<|im_start|>system\nJudge whether the Document meets the requirements "
+            "based on the Query and the Instruct provided. Note that the answer can "
+            'only be "yes" or "no".<|im_end|>\n<|im_start|>user\n'
+            "<Instruct>: instruction\n<Query>: \n<Document>: <|im_end|>\n"
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        )
+
+        model = self._load_with_tokenizer(tmp_path, tokenizer)
+
+        assert model._prefix_tokens == [
+            "<|im_start|>system\n"
+            f"{model._CAUSAL_LM_SYSTEM_PROMPT}<|im_end|>\n"
+            "<|im_start|>user\n"
+        ]
+        assert model._suffix_tokens == [
+            "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        ]
+
+    _QWEN_FALLBACK_PREFIX = (
+        "<|im_start|>system\n"
+        "Judge whether the Document meets the requirements based on the "
+        "Query and the Instruct provided. Note that the answer can only be "
+        '"yes" or "no".'
+        "<|im_end|>\n<|im_start|>user\n"
+    )
+    _QWEN_FALLBACK_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+    def test_load_causal_lm_falls_back_when_template_rendering_raises(self, tmp_path):
+        tokenizer = self._make_causal_tokenizer()
+        tokenizer.apply_chat_template.side_effect = ValueError("bad template")
+
+        model = self._load_with_tokenizer(tmp_path, tokenizer)
+
+        assert model._prefix_tokens == [self._QWEN_FALLBACK_PREFIX]
+        assert model._suffix_tokens == [self._QWEN_FALLBACK_SUFFIX]
+
+    def test_load_causal_lm_falls_back_when_no_chat_template(self, tmp_path):
+        tokenizer = self._make_causal_tokenizer()
+        tokenizer.chat_template = None
+
+        model = self._load_with_tokenizer(tmp_path, tokenizer)
+
+        assert model._prefix_tokens == [self._QWEN_FALLBACK_PREFIX]
+        assert model._suffix_tokens == [self._QWEN_FALLBACK_SUFFIX]
+        tokenizer.apply_chat_template.assert_not_called()
+
+    def test_load_causal_lm_raises_for_non_qwen_without_usable_template(self, tmp_path):
+        tokenizer = self._make_causal_tokenizer()
+        tokenizer.chat_template = None
+
+        with pytest.raises(ValueError, match="no built-in scoring frame"):
+            self._load_with_tokenizer(
+                tmp_path,
+                tokenizer,
+                name="reranker_v2_6b",
+                architecture="MistralForCausalLM",
+                model_type="mistral",
+            )
+
+    def test_load_causal_lm_propagates_unexpected_render_error(self, tmp_path):
+        tokenizer = self._make_causal_tokenizer()
+        tokenizer.apply_chat_template.side_effect = MemoryError("oom")
+
+        with pytest.raises(MemoryError):
+            self._load_with_tokenizer(tmp_path, tokenizer)
+
+    def test_load_causal_lm_does_not_duplicate_think_prefill(self, tmp_path):
+        tokenizer = self._make_causal_tokenizer()
+        sentinel = "<<__CONTENT_SENTINEL__>>"
+        # Template already emits the empty-think prefill via add_generation_prompt.
+        tokenizer.apply_chat_template.return_value = (
+            f"P{sentinel}T<think>\n\n</think>\n\n"
+        )
+
+        model = self._load_with_tokenizer(tmp_path, tokenizer)
+
+        assert model._prefix_tokens == ["P"]
+        assert model._suffix_tokens == ["T<think>\n\n</think>\n\n"]
+
+    def test_load_causal_lm_appends_prefill_on_partial_think_in_tail(self, tmp_path):
+        tokenizer = self._make_causal_tokenizer()
+        sentinel = "<<__CONTENT_SENTINEL__>>"
+        # "</think>" appears in the tail but not as the empty-think prefill, so the
+        # prefill must still be appended (no false-positive suppression).
+        tokenizer.apply_chat_template.return_value = f"P{sentinel}T</think> extra"
+
+        model = self._load_with_tokenizer(tmp_path, tokenizer)
+
+        assert model._prefix_tokens == ["P"]
+        assert model._suffix_tokens == ["T</think> extra<think>\n\n</think>\n\n"]
+
+    def test_load_causal_lm_rejects_tokenizer_without_chatml_tokens(self, tmp_path):
+        tokenizer = self._make_causal_tokenizer()
+        tokenizer.chat_template = None  # force the built-in ChatML frame
+
+        def encode(text, add_special_tokens=False):
+            # Simulate a tokenizer that does not know ChatML control tokens and
+            # splits them into multiple ordinary-text pieces.
+            if text in ("<|im_start|>", "<|im_end|>"):
+                return [0, 0]
+            return [text]
+
+        tokenizer.encode.side_effect = encode
+
+        with pytest.raises(ValueError, match="ChatML control token"):
+            self._load_with_tokenizer(tmp_path, tokenizer)
+
+    def test_load_causal_lm_rejects_bad_tokenizer_when_sentinel_survives(
+        self, tmp_path
+    ):
+        # The ChatML-token validation must also run on the template-derived frame,
+        # not only the built-in fallback. Here the sentinel survives (template path)
+        # but the tokenizer does not know the control tokens.
+        tokenizer = self._make_causal_tokenizer()
+        sentinel = "<<__CONTENT_SENTINEL__>>"
+        tokenizer.apply_chat_template.return_value = (
+            f"<|im_start|>system\nSYS<|im_end|>\n<|im_start|>user\n{sentinel}"
+            "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        )
+
+        def encode(text, add_special_tokens=False):
+            if text in ("<|im_start|>", "<|im_end|>"):
+                return [0, 0]
+            return [text]
+
+        tokenizer.encode.side_effect = encode
+
+        with pytest.raises(ValueError, match="ChatML control token"):
+            self._load_with_tokenizer(tmp_path, tokenizer)
 
     def test_validate_architecture_accepts_causal_lm_reranker(self, tmp_path):
         """CausalLM architecture is accepted when directory name contains 'reranker'."""
@@ -133,7 +312,9 @@ class TestCausalLMReranker:
 
         model.model = MagicMock(side_effect=mock_forward)
 
-        result = model._rerank_causal_lm("test query", ["relevant doc", "irrelevant doc"])
+        result = model._rerank_causal_lm(
+            "test query", ["relevant doc", "irrelevant doc"]
+        )
 
         assert isinstance(result, RerankOutput)
         assert len(result.scores) == 2
@@ -165,7 +346,9 @@ class TestCausalLMReranker:
         model._loaded = True
 
         mock_result = RerankOutput(scores=[0.9], indices=[0], total_tokens=10)
-        with patch.object(model, "_rerank_causal_lm", return_value=mock_result) as mock_method:
+        with patch.object(
+            model, "_rerank_causal_lm", return_value=mock_result
+        ) as mock_method:
             result = model.rerank("query", ["doc"])
             mock_method.assert_called_once()
             assert result.scores == [0.9]
@@ -178,7 +361,9 @@ class TestCausalLMReranker:
         model._loaded = True
 
         mock_result = RerankOutput(scores=[0.5], indices=[0], total_tokens=10)
-        with patch.object(model, "_rerank_causal_lm", return_value=mock_result) as mock_method:
+        with patch.object(
+            model, "_rerank_causal_lm", return_value=mock_result
+        ) as mock_method:
             model.rerank("query", ["doc"])
             # max_length=None should use default 8192 for CausalLM
             args, _ = mock_method.call_args
@@ -192,7 +377,9 @@ class TestCausalLMReranker:
         model._loaded = True
 
         mock_result = RerankOutput(scores=[0.5], indices=[0], total_tokens=10)
-        with patch.object(model, "_rerank_causal_lm", return_value=mock_result) as mock_method:
+        with patch.object(
+            model, "_rerank_causal_lm", return_value=mock_result
+        ) as mock_method:
             model.rerank("query", ["doc"], max_length=1024)
             args, _ = mock_method.call_args
             assert args[2] == 1024
@@ -205,7 +392,9 @@ class TestCausalLMReranker:
         model._loaded = True
 
         mock_result = RerankOutput(scores=[0.5], indices=[0], total_tokens=10)
-        with patch.object(model, "_rerank_causal_lm", return_value=mock_result) as mock_method:
+        with patch.object(
+            model, "_rerank_causal_lm", return_value=mock_result
+        ) as mock_method:
             model.rerank("query", ["doc"], max_length=512)
             args, _ = mock_method.call_args
             assert args[2] == 512
@@ -516,9 +705,7 @@ class TestRerankerCompileFallback:
         model._loaded = True
         model._is_causal_lm = False
         model._is_compiled = True
-        model._compiled_seq_logits = MagicMock(
-            side_effect=RuntimeError("compile fail")
-        )
+        model._compiled_seq_logits = MagicMock(side_effect=RuntimeError("compile fail"))
 
         # Mock processor
         mock_processor = MagicMock()
