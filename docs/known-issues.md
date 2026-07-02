@@ -662,6 +662,91 @@ single upstream PR against `jundot/omlx`.
 
 ---
 
+## `laguna` (poolside Laguna-XS.2) — 500 on load; mlx-lm-layout checkpoint, mlx-vlm-only class
+
+- **First observed:** 2026-06-15 (`Laguna-XS.2-mxfp8`, plain no-tools chat → 500)
+- **Status:** fixed on topic branch `feat/laguna-vlm-native-text`
+  (`omlx/model_discovery.py`, `omlx/engine/vlm.py`); not currently part of
+  `fork-main`. Upstream PR candidate (the `format=mlx` skip-sanitize gate is
+  an mlx-vlm bug for native-text families).
+- **Severity:** every public MLX laguna checkpoint is unservable as shipped.
+  All Hub MLX laguna builds (`mlx-community/Laguna-XS.2-*`, OsaurusAI, oQ,
+  MuVeraAI, ...) are converted in **mlx-lm layout** (top-level `model.*` /
+  `lm_head.*`, `format=mlx`); `mlx-lm` has **no** laguna class (any version,
+  incl. `main`/0.31.3), and `mlx-vlm`'s laguna wraps the LM under
+  `language_model.`.
+
+### Symptom
+
+```text
+omlx.server - ERROR - POST /v1/chat/completions -> 500 (unhandled):
+  Model type laguna not supported.            # (1) before routing fix
+omlx.engine_pool - WARNING - VLM loading failed for Laguna-XS.2-mxfp8,
+  falling back to LLM: Received 1195 parameters not in model: ...
+  model.norm.weight.; LLM fallback also failed: Model type laguna not supported.
+```
+
+### Root cause
+
+Two compounding gaps:
+
+1. **Routing.** `detect_model_type` had no entry for `laguna`, so it
+   classified as `llm` and routed to the `BatchedEngine` (mlx-lm), which has
+   no laguna class -> `Model type laguna not supported.` (the bare-period
+   message is mlx-lm's `_get_classes`, distinct from mlx-vlm's
+   `... not supported. Error: ...`).
+2. **Load layout.** Routed to mlx-vlm, `load_model` **skips `Model.sanitize`
+   when `format=mlx`** (same gate as the LFM2.5-VL-450M entry above). The
+   checkpoint is mlx-lm layout (`model.*` / `lm_head.*`) but laguna's `Model`
+   expects `language_model.*`; its `sanitize` exists precisely to remap them,
+   but never runs -> all 1195 tensors mismatch, and the `nn.quantize`
+   predicate (`f"{p}.scales" in weights`) misfires because it keys on the
+   unsanitized names.
+
+The checkpoint is otherwise already in mlx-laguna form (stacked
+`mlp.switch_mlp.*`, `mlp.shared_expert.*`, `mlp.gate.proj` router), so the
+MoE/router/compressed-tensor sanitize helpers are all no-ops -- the only
+effective transform laguna's sanitize applies is the `language_model.` prefix.
+
+### Local fix
+
+- `omlx/model_discovery.py`: add `"laguna"` to `VLM_NATIVE_TEXT_MODEL_TYPES`
+  (alongside `cohere2_moe`) -> routes to the VLM engine's native-text path.
+- `omlx/engine/vlm.py`:
+  - Generalize the Cohere2-MoE special-case loader/guards to all
+    `VLM_NATIVE_TEXT_MODEL_TYPES` (rename `_load_cohere2_moe_text_model` ->
+    `_load_vlm_native_text_model`; image/audio rejection via
+    `_is_vlm_native_text_model_type`).
+  - Add `_force_sanitize_for_mlx_format(model_dir)`: scoped context manager
+    that strips the `format` key from the safetensors metadata `load_model`
+    reads (only for files under the model dir) so `is_mlx_format` is False and
+    the model's own sanitize runs before quantization. `safe_open` is used
+    only for this metadata probe (weights load via `mx.load`), so the patch
+    is isolated.
+  - Per-layer quant override keys (`model.layers.{1,2,3}.mlp.gate.proj`,
+    `group_size=64`) are already bridged by the existing
+    `expand_per_layer_quant_keys` in the `load_config` wrapper, which adds the
+    `language_model.`-prefixed variants the `nn.quantize` predicate needs.
+
+### Verified
+
+Full in-process load + greedy decode of `Laguna-XS.2-mxfp8`: 1195/1195 params
+matched, `language_model.lm_head.scales` quantized; `"The capital of France
+is"` -> `" Paris."`. Lazy-load regression + the `_force_sanitize_for_mlx_format`
+metadata-stripping mechanism covered by `tests/test_vlm_cohere2_moe_loader.py`;
+routing by `tests/test_model_discovery.py`.
+
+### Caveats / follow-ups
+
+- The bundled tokenizer warns `fix_mistral_regex=True` (poolside tokenizer
+  carries a Mistral-style regex); output is coherent but tokenization may be
+  marginally off. Upstream tokenizer config issue, not an oMLX bug.
+- Upstream candidacy: the `format=mlx` skip-sanitize gate should run sanitize
+  for native-text families in `mlx-vlm`; bundle the routing/loader
+  generalization for a `jundot/omlx` PR.
+
+---
+
 ## VLMModelAdapter.layers — `.blocks` vs `.layers` AttributeError on Molmo-family + Moondream3
 
 - **First observed:** 2026-05-16 (Molmo2-8B-mxfp8 image request hangs)
