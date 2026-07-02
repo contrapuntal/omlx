@@ -111,6 +111,9 @@ AMBIGUOUS_EMBEDDING_MODEL_TYPES = {
     "qwen3",
     "gemma3-text",
     "gemma3_text",
+    # LFM2: model_type "lfm2" is shared by Lfm2ForCausalLM (LLM, e.g.
+    # LFM2-1.2B/3B) and Lfm2Model (LFM2-Embedding finetunes). Disambiguate
+    # via EMBEDDING_ARCHITECTURES below or sentence-transformers modules.json.
     "lfm2",
 }
 
@@ -126,6 +129,7 @@ EMBEDDING_ARCHITECTURES = {
     "SiglipModel",
     "SiglipVisionModel",
     "SiglipTextModel",
+    "Lfm2Model",  # LFM2-Embedding finetunes (Lfm2ForCausalLM is the LLM)
 }
 
 # Supported reranker architectures

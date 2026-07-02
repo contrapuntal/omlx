@@ -185,6 +185,18 @@ class TestDetectModelType:
         (llm_dir / "config.json").write_text(json.dumps(config))
         assert detect_model_type(llm_dir) == "llm"
 
+    def test_detect_lfm2_embedding_is_embedding(self, tmp_path):
+        """LFM2-Embedding finetunes share model_type 'lfm2' with the LLM but
+        use the Lfm2Model architecture, so they must resolve to embedding."""
+        emb_dir = tmp_path / "LFM2-Embedding-1.2B"
+        emb_dir.mkdir()
+        config = {
+            "model_type": "lfm2",
+            "architectures": ["Lfm2Model"],
+        }
+        (emb_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(emb_dir) == "embedding"
+
     def test_detect_qwen3_vl_reranker(self, tmp_path):
         """Qwen3VLForConditionalGeneration + 'reranker' in dir name → reranker."""
         reranker_dir = tmp_path / "Qwen3-VL-Reranker-2B-4bit"
