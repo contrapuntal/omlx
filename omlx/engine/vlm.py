@@ -90,6 +90,16 @@ COHERE2_MOE_MODEL_TYPE = "cohere2_moe"
 MINIMAX_M3_VL_MODEL_TYPE = "minimax_m3_vl"
 MINIMAX_M3_MODEL_TYPES = {"minimax_m3", MINIMAX_M3_VL_MODEL_TYPE}
 
+
+def _is_vlm_native_text_model_type(model_type: str | None) -> bool:
+    """True for text-only model types implemented in mlx-vlm (no image input)."""
+    if not model_type:
+        return False
+    from ..model_discovery import VLM_NATIVE_TEXT_MODEL_TYPES
+
+    normalized = model_type.lower().replace("-", "_")
+    return normalized in VLM_NATIVE_TEXT_MODEL_TYPES
+
 DIFFUSION_PREFILL_STEP_SIZE = 2048
 
 # Per-model OCR generation defaults from official configs.
@@ -163,22 +173,29 @@ def _attach_vlm_tokenizer_runtime(tokenizer: Any, model_path: Path, eos_token_id
     return tokenizer
 
 
-def _load_cohere2_moe_text_model(
+def _load_vlm_native_text_model(
     model_name: str,
     *,
     trust_remote_code: bool = False,
 ):
-    """Load Cohere2 MoE through mlx-vlm with a tokenizer-only fallback."""
+    """Load an mlx-vlm native text-only model with a tokenizer-only fallback.
+
+    Text-only families implemented in mlx-vlm (e.g. Cohere2 MoE, Laguna) have
+    no image processor, so mlx-vlm's ``load()`` — which always calls
+    ``load_processor`` — fails. Load the model and tokenizer directly,
+    falling back to ``AutoTokenizer`` when no processor is available.
+    """
     from mlx_vlm.utils import get_model_path, load_model, load_processor
     from transformers import AutoTokenizer
 
     model_path = get_model_path(model_name)
-    model = load_model(
-        model_path,
-        lazy=False,
-        strict=True,
-        trust_remote_code=trust_remote_code,
-    )
+    with _force_sanitize_for_mlx_format(model_path):
+        model = load_model(
+            model_path,
+            lazy=False,
+            strict=True,
+            trust_remote_code=trust_remote_code,
+        )
 
     eos_token_id = getattr(getattr(model, "config", None), "eos_token_id", None)
     try:
@@ -190,7 +207,7 @@ def _load_cohere2_moe_text_model(
         )
     except Exception as exc:
         logger.debug(
-            "mlx-vlm processor load failed for Cohere2 MoE %s; "
+            "mlx-vlm processor load failed for native text model %s; "
             "falling back to AutoTokenizer: %s",
             model_name,
             exc,
@@ -282,10 +299,44 @@ def _patch_torch_free_image_processor():
     except ImportError:
         return
 
+    # transformers' is_torch_available / is_torchvision_available are
+    # @lru_cache-decorated, so a running process started before torch was
+    # installed will permanently see torch as missing — even after pip install.
+    # Clear the caches each model-load so a mid-run install is picked up for
+    # any availability check that still consults them (requires_backends,
+    # _resolve_backend, etc.). The transformers module-level class bindings
+    # resolved by _LazyModule on first access still need a restart, which
+    # the second block below detects and surfaces loudly.
+    try:
+        from transformers.utils.import_utils import (
+            is_torch_available,
+            is_torchvision_available,
+        )
+        is_torch_available.cache_clear()
+        is_torchvision_available.cache_clear()
+    except (ImportError, AttributeError):
+        pass
+
     if not getattr(transformers.AutoImageProcessor, "is_dummy", False):
         # torch+torchvision available, AutoImageProcessor works as-is.
         _torch_free_ip_patched = True
         return
+
+    try:
+        from transformers.utils.import_utils import (
+            is_torch_available as _torch_ok,
+            is_torchvision_available as _tv_ok,
+        )
+        if _torch_ok() and _tv_ok():
+            logger.warning(
+                "transformers.AutoImageProcessor is a DummyObject but torch "
+                "and torchvision are now installed. Restart oMLX to pick up "
+                "fast image processors (Lfm2VlImageProcessor, "
+                "Qwen2VLImageProcessor, ...). Falling through to PIL "
+                "fallback for OCR processors."
+            )
+    except (ImportError, AttributeError):
+        pass
 
     for module_path, cls_name in (
         ("mlx_vlm.models.glm_ocr.processing", "GlmOcrProcessor"),
@@ -886,6 +937,73 @@ def _remap_nested_visual_on_load(model_dir: Path):
         _vu.load_model = original_load_model
 
 
+@contextlib.contextmanager
+def _force_sanitize_for_mlx_format(model_dir: Path):
+    """Force ``load_model`` to run ``Model.sanitize`` on an mlx-format checkpoint.
+
+    mlx-vlm's ``load_model`` skips ``Model.sanitize`` when the safetensors
+    metadata declares ``format=mlx``, assuming such checkpoints are already in
+    the model's native layout. Public Laguna MLX checkpoints are converted in
+    *mlx-lm* layout (top-level ``model.*`` / ``lm_head.*``) yet stamped
+    ``format=mlx``, so laguna's ``sanitize`` — which remaps those keys under
+    ``language_model.`` — never runs and all weights mismatch (and the
+    ``nn.quantize`` predicate misfires, since it keys on the unsanitized
+    names). Strip the ``format`` key from the metadata ``load_model`` reads for
+    files under *model_dir*, so ``is_mlx_format`` is ``False`` and the model's
+    own sanitize runs before quantization. The MoE/router/compressed-tensor
+    sanitize helpers are no-ops on already-converted weights, so this is safe.
+
+    Scoped to a single ``load_model(...)`` call and to *model_dir*'s files, so
+    concurrent loads of genuine mlx-format checkpoints are unaffected.
+    """
+    import safetensors as _st
+
+    original_safe_open = _st.safe_open
+    try:
+        model_dir_resolved = Path(model_dir).resolve()
+    except Exception:
+        model_dir_resolved = None
+
+    class _NoFormatMeta:
+        def __init__(self, ctx):
+            self._ctx = ctx
+            self._f = None
+
+        def __enter__(self):
+            self._f = self._ctx.__enter__()
+            return self
+
+        def __exit__(self, *exc):
+            return self._ctx.__exit__(*exc)
+
+        def metadata(self):
+            meta = self._f.metadata()
+            if meta and "format" in meta:
+                meta = {k: v for k, v in meta.items() if k != "format"}
+            return meta
+
+        def __getattr__(self, name):
+            return getattr(self._f, name)
+
+    def _within_model_dir(path) -> bool:
+        if model_dir_resolved is None:
+            return False
+        try:
+            return Path(path).resolve().is_relative_to(model_dir_resolved)
+        except Exception:
+            return False
+
+    def _patched_safe_open(path, *args, **kwargs):
+        ctx = original_safe_open(path, *args, **kwargs)
+        return _NoFormatMeta(ctx) if _within_model_dir(path) else ctx
+
+    _st.safe_open = _patched_safe_open
+    try:
+        yield
+    finally:
+        _st.safe_open = original_safe_open
+
+
 # Models that only support a single image per request
 SINGLE_IMAGE_ONLY_MODELS = {
     "llava_next",
@@ -1379,8 +1497,10 @@ class VLMBatchedEngine(BaseEngine):
                     model, processor = custom_loaded
                     return model, processor
 
-                if _read_config_model_type(self._model_name) == COHERE2_MOE_MODEL_TYPE:
-                    return _load_cohere2_moe_text_model(
+                if _is_vlm_native_text_model_type(
+                    _read_config_model_type(self._model_name)
+                ):
+                    return _load_vlm_native_text_model(
                         self._model_name,
                         trust_remote_code=self._trust_remote_code,
                     )
@@ -2215,9 +2335,11 @@ class VLMBatchedEngine(BaseEngine):
         num_audios = len(audio) if audio else 0
 
         model_type = self.model_type or ""
-        if model_type == COHERE2_MOE_MODEL_TYPE and (num_images > 0 or num_audios > 0):
+        if _is_vlm_native_text_model_type(model_type) and (
+            num_images > 0 or num_audios > 0
+        ):
             raise InvalidRequestError(
-                "Cohere2 MoE is a text-only model and does not support "
+                f"{model_type} is a text-only model and does not support "
                 "image or audio input.",
                 field="messages",
             )

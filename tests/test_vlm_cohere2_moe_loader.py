@@ -12,7 +12,7 @@ pytest.importorskip("mlx.core")
 from omlx.engine import vlm as vlm_module
 from omlx.engine.vlm import (
     VLMBatchedEngine,
-    _load_cohere2_moe_text_model,
+    _load_vlm_native_text_model,
 )
 from omlx.exceptions import InvalidRequestError
 
@@ -45,7 +45,7 @@ def test_cohere2_moe_loader_uses_upstream_processor(monkeypatch, tmp_path):
     monkeypatch.setattr(vlm_utils, "load_model", lambda *a, **k: model)
     monkeypatch.setattr(vlm_utils, "load_processor", lambda *a, **k: processor)
 
-    loaded_model, loaded_processor = _load_cohere2_moe_text_model("cohere")
+    loaded_model, loaded_processor = _load_vlm_native_text_model("cohere")
 
     assert loaded_model is model
     assert loaded_processor is processor
@@ -78,7 +78,7 @@ def test_cohere2_moe_loader_falls_back_to_tokenizer(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(vlm_utils, "StoppingCriteria", _FakeStoppingCriteria)
 
-    loaded_model, loaded_processor = _load_cohere2_moe_text_model("cohere")
+    loaded_model, loaded_processor = _load_vlm_native_text_model("cohere")
 
     assert loaded_model is model
     assert loaded_processor is tokenizer
@@ -113,3 +113,49 @@ def test_cohere2_moe_rejects_audio_input():
             images=[],
             audio=[("samples", 16000)],
         )
+
+
+def test_laguna_rejects_image_input():
+    """Native text models other than Cohere2 (e.g. Laguna) also reject images."""
+    engine = VLMBatchedEngine("laguna")
+    engine._vlm_model = SimpleNamespace(config=SimpleNamespace(model_type="laguna"))
+
+    with pytest.raises(InvalidRequestError, match="text-only"):
+        engine._prepare_vision_inputs(
+            [{"role": "user", "content": "describe"}],
+            images=[object()],
+        )
+
+
+def test_force_sanitize_strips_mlx_format_within_model_dir(tmp_path):
+    """``_force_sanitize_for_mlx_format`` hides ``format=mlx`` for in-dir files.
+
+    mlx-vlm's ``load_model`` keys ``is_mlx_format`` off the safetensors
+    ``format`` metadata and skips ``Model.sanitize`` when it is ``"mlx"``.
+    The context manager must drop that key for files under the model dir
+    (so sanitize runs) while leaving other metadata and outside files intact.
+    """
+    import numpy as np
+    import safetensors
+    import safetensors.numpy as stnp
+
+    from omlx.engine.vlm import _force_sanitize_for_mlx_format
+
+    inside = tmp_path / "model" / "weights.safetensors"
+    inside.parent.mkdir()
+    outside = tmp_path / "other.safetensors"
+    tensors = {"w": np.zeros((2, 2), dtype=np.float32)}
+    stnp.save_file(tensors, str(inside), metadata={"format": "mlx", "keep": "1"})
+    stnp.save_file(tensors, str(outside), metadata={"format": "mlx"})
+
+    with _force_sanitize_for_mlx_format(inside.parent):
+        with safetensors.safe_open(str(inside), framework="np") as f:
+            meta = f.metadata()
+            assert "format" not in meta  # dropped → sanitize will run
+            assert meta.get("keep") == "1"  # other metadata preserved
+        with safetensors.safe_open(str(outside), framework="np") as f:
+            assert f.metadata().get("format") == "mlx"  # outside dir untouched
+
+    # Restored after the context exits.
+    with safetensors.safe_open(str(inside), framework="np") as f:
+        assert f.metadata().get("format") == "mlx"

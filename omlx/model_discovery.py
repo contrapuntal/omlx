@@ -71,6 +71,7 @@ VLM_MODEL_TYPES = {
 # models and adapts their language model to oMLX's scheduler.
 VLM_NATIVE_TEXT_MODEL_TYPES = {
     "cohere2_moe",
+    "laguna",
     "minimax_m3",
 }
 

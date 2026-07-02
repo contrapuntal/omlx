@@ -283,6 +283,15 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
 
+    def test_detect_laguna_as_vlm_without_vision_config(self, tmp_path):
+        """Laguna is a text-only MoE implemented by mlx-vlm, not mlx-lm."""
+        config = {
+            "model_type": "laguna",
+            "architectures": ["LagunaForCausalLM"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
     def test_detect_vlm_by_architecture(self, tmp_path):
         """Test detection of VLM model by architecture name."""
         config = {
