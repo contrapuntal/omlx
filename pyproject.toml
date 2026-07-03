@@ -113,6 +113,15 @@ dependencies = [
     "cohere_melody>=0.9.0",
     # mlx-vlm from commit 66e68ce (v0.7.4). oMLX model implementations remain registered
     # by their pre-load patches.
+    # NOTE: the vendored omlx.patches.mlx_vlm_minimax_m3_compat carry is NOT
+    # redundant at this pin: it adds oMLX's custom grouped sparse attention
+    # (msa.py) wired to omlx/custom_kernels/minimax_m3, plus server glue
+    # (get_model_and_args/process_inputs/StoppingCriteria/load_config/
+    # prompt_utils), and upstream keeps landing MiniMax fixes inside the
+    # vendored tree itself (e.g. #4228 sparse-cache KV slicing). The
+    # apply-patch is gated on minimax_m3 model types so it stays inert for
+    # other models. Re-validate against a real MiniMax M3 checkout before
+    # any pruning.
     "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@66e68ce36816cb5134acba3b0d72c6271f35ba24",
     # mlx-vlm requires mlx-audio>=0.5.2 in the shared runtime.
     "mlx-audio @ git+https://github.com/Blaizzy/mlx-audio@94c7716212b2228f178d2f9c7619a591fd1b0b78",
