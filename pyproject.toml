@@ -119,10 +119,16 @@ dependencies = [
     "cohere_melody>=0.9.0",
     # mlx-vlm from commit 9909cee (PR #1427, adds baidu/Unlimited-OCR support
     # via a dedicated unlimited_ocr package with ring sliding-window attention).
-    # NOTE: this pin also re-introduces upstream MiniMax M3 (#1374), so the
-    # vendored omlx.patches.mlx_vlm_minimax_m3_compat carry is now redundant and
-    # a candidate for removal (its apply-patch only fires for minimax_m3 model
-    # types and appends its vendor path as a fallback, so it stays inert here).
+    # NOTE: this pin also re-introduces upstream MiniMax M3 (#1374), which now
+    # co-exists with the vendored omlx.patches.mlx_vlm_minimax_m3_compat carry.
+    # That carry is NOT redundant: upstream's minimax_m3_vl has no `msa`
+    # submodule, whereas the vendored one adds oMLX's custom grouped sparse
+    # attention (msa.py) wired to omlx/custom_kernels/minimax_m3, plus server
+    # glue (get_model_and_args/process_inputs/StoppingCriteria/load_config/
+    # prompt_utils). The apply-patch is gated on minimax_m3 model types and
+    # appends its vendor path as a fallback, so it stays inert for other models.
+    # The native-vs-vendored __path__ interleaving wants validation against a
+    # real MiniMax M3 checkout before any pruning.
     "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@9909cee70001dcb7a901ce3ec859c2cc5cea80c1",
     "Pillow>=9.0.0",
     # dflash-mlx v0.1.10+omlx.7 (c55324c) - jundot fork of bstnxbt 0.1.10 (9ca0028).
