@@ -303,6 +303,11 @@ include = ["omlx*"]
 # (e.g. mlx-audio -> mlx-lm==0.31.1) so the resolver accepts them.
 override-dependencies = [
     "mlx==0.32.2",
+    # xgrammar is installed --no-deps in the dev env (see the dev group note),
+    # but the resolver still reads its declared `transformers>=4.38.0,<5`,
+    # which is unsatisfiable against the project's `transformers>=5.7.0,<5.13`.
+    # Override so resolution matches how xgrammar is actually installed.
+    "transformers>=5.7.0,<5.13",
     "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ab1806e8f5d6aa035973af194a1b9198ab4754dc",
 ]
 
