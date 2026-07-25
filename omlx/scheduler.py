@@ -8099,12 +8099,108 @@ class Scheduler:
         )
         return True
 
+    # Cache classes the registry has no handler for, yet whose live objects
+    # ``get_handler_by_class_name`` still routes somewhere sound.
+    _EXTRA_RECONSTRUCTIBLE_CACHE_TYPES = frozenset({"SizedArraysCache"})
+
+    def _prefix_reuse_supports_cache_class(self, class_name: str) -> bool:
+        """True when the paged round trip can rebuild ``class_name`` faithfully.
+
+        Reconstruction dispatches on the stored ``type(cache).__name__`` through
+        ``CacheTypeRegistry``, so a *registered* class round-trips as itself:
+        rotating/arrays/CacheList layers keep their class and meta_state via
+        their handlers plus the boundary-snapshot path, and the plainly
+        sliceable classes round-trip by block slicing.
+
+        An *unregistered* class is the problem. ``detect_cache_type`` falls back
+        to structural sniffing, so any ``KVCache`` subclass looks like a plain
+        ``KVCache``, gets ``DefaultCacheHandler`` (``supports_block_slicing =
+        True``) and is rebuilt as a vanilla ``KVCache`` with its extra state
+        dropped. Only that case is refused here.
+        """
+        if class_name in _KNOWN_SLICEABLE_CACHE_TYPES:
+            return True
+        if class_name in self._EXTRA_RECONSTRUCTIBLE_CACHE_TYPES:
+            return True
+        if HAS_CACHE_TYPE_HANDLERS and CacheTypeRegistry is not None:
+            return class_name in CacheTypeRegistry.list_known_class_names()
+        # Without the registry nothing beyond the plainly sliceable set can be
+        # rebuilt, so treat everything else as unsupported.
+        return False
+
+    def _cache_layer_is_reconstructible(self, layer: Any) -> bool:
+        """Recursive per-layer form of :meth:`_prefix_reuse_supports_cache_class`."""
+        if layer is None:
+            return True
+        # Test doubles carry no real cache contract.
+        if type(layer).__module__.startswith("unittest.mock"):
+            return True
+        sub_caches = getattr(layer, "caches", None)
+        if isinstance(sub_caches, (list, tuple)):
+            # CacheList itself round-trips, but only if every sub-cache does:
+            # its handler stores sub-class names and re-dispatches per name.
+            if not self._prefix_reuse_supports_cache_class(type(layer).__name__):
+                return False
+            return all(self._cache_layer_is_reconstructible(sub) for sub in sub_caches)
+        return self._prefix_reuse_supports_cache_class(type(layer).__name__)
+
+    def _model_has_unreconstructible_cache(self) -> bool:
+        """True when ``model.make_cache()`` builds cache layers of a class the
+        paged prefix round trip silently downgrades.
+
+        Unlimited-OCR's ``RingSlidingKVCache`` subclasses ``KVCache`` and is not
+        in the registry, so it is sniffed as a plain ``KVCache``, rebuilt as one,
+        and loses ``window_size`` / ``prefill_length`` / ``_ring_pos``. The model
+        then attends over an unbounded history and generation degenerates into
+        repetition with no EOS. The pre-existing rotating guard cannot catch it:
+        it runs only for *exact* prefix hits and inspects the *already
+        reconstructed* cache, which is a plain ``KVCache`` by then.
+
+        Probed once per scheduler and memoized. A probe that raises is **not**
+        memoized and refuses reuse for that request, so a transient failure can
+        never be recorded as "safe" and then silently reused.
+        """
+        cached = getattr(self, "_non_sliceable_cache_model", None)
+        if cached is not None:
+            return cached
+
+        try:
+            layers = make_prompt_cache(self.model) or []
+        except Exception:
+            logger.warning(
+                "Could not probe model cache classes; refusing prefix cache "
+                "reuse for this request rather than risking a silent downgrade",
+                exc_info=True,
+            )
+            return True
+
+        result = False
+        for layer in layers:
+            if not self._cache_layer_is_reconstructible(layer):
+                logger.info(
+                    "Prefix cache reuse disabled: model builds %s layers, which "
+                    "have no cache-type handler and would be rebuilt as plain "
+                    "KVCache, dropping their state",
+                    type(layer).__name__,
+                )
+                result = True
+                break
+
+        self._non_sliceable_cache_model = result
+        return result
+
     def _prepare_prefix_cache_for_request(self, request: Request) -> None:
         if request.request_id in self._prefix_cache_prepared:
             return
 
-        # Check prefix cache for cached KV state
-        if self.block_aware_cache is not None:
+        # Check prefix cache for cached KV state. Models whose cache layers do
+        # not survive reconstruction skip the lookup entirely and fall through
+        # to full prefill below — including on partial hits, which bypass the
+        # exact-hit guard further down.
+        if (
+            self.block_aware_cache is not None
+            and not self._model_has_unreconstructible_cache()
+        ):
             # Use paged cache
             block_table, remaining = self.block_aware_cache.fetch_cache(
                 request.request_id,
