@@ -906,6 +906,54 @@ class TestSourceHasNextnTensors:
         )
 
 
+class TestHoistTieWordEmbeddings:
+    """mlx-vlm's ModelConfig.from_dict rebuilds text_config from the *root*
+    level, so a nested-only tie_word_embeddings is silently lost and TextConfig
+    falls back to False. The language model then builds an untied lm_head and
+    loading fails with "Missing 1 parameters: language_model.lm_head.weight",
+    after which oMLX degrades the VLM to a text-only engine that ignores images.
+    """
+
+    def test_hoists_from_text_config(self):
+        from omlx.oq import _hoist_tie_word_embeddings
+
+        cfg = {"model_type": "qwen2_vl", "text_config": {"tie_word_embeddings": True}}
+        _hoist_tie_word_embeddings(cfg)
+        assert cfg["tie_word_embeddings"] is True
+        # Nested copy is left alone.
+        assert cfg["text_config"]["tie_word_embeddings"] is True
+
+    def test_hoists_false_value(self):
+        """False must hoist too — absent and False are not equivalent here."""
+        from omlx.oq import _hoist_tie_word_embeddings
+
+        cfg = {"model_type": "qwen2_vl", "text_config": {"tie_word_embeddings": False}}
+        _hoist_tie_word_embeddings(cfg)
+        assert cfg["tie_word_embeddings"] is False
+
+    def test_does_not_override_existing_top_level(self):
+        from omlx.oq import _hoist_tie_word_embeddings
+
+        cfg = {
+            "tie_word_embeddings": False,
+            "text_config": {"tie_word_embeddings": True},
+        }
+        _hoist_tie_word_embeddings(cfg)
+        assert cfg["tie_word_embeddings"] is False
+
+    def test_noop_when_absent_everywhere(self):
+        from omlx.oq import _hoist_tie_word_embeddings
+
+        cfg = {"model_type": "llama"}
+        _hoist_tie_word_embeddings(cfg)
+        assert cfg == {"model_type": "llama"}
+
+    def test_ignores_non_dict_sections(self):
+        from omlx.oq import _hoist_tie_word_embeddings
+
+        cfg = {"model_type": "llama", "text_config": None}
+        _hoist_tie_word_embeddings(cfg)
+        assert "tie_word_embeddings" not in cfg
 # =============================================================================
 # Test validate_quantizable
 # =============================================================================
