@@ -3790,6 +3790,39 @@ def _source_has_nextn_tensors(keys, config: dict) -> bool:
     return any(k.startswith(prefixes) for k in keys)
 
 
+def _hoist_tie_word_embeddings(config: dict) -> None:
+    """Copy a nested ``tie_word_embeddings`` up to the top level (in place).
+
+    Several VLM checkpoints declare the flag only inside ``text_config``, but
+    mlx-vlm's ``ModelConfig.from_dict`` rebuilds ``text_config`` from the *root*
+    level (``params["text_config"] = {k: v for k, v in params.items() if k !=
+    "vision_config"}``), so a nested-only flag never reaches ``TextConfig`` and
+    falls back to its ``False`` default. The language model then builds an
+    untied ``lm_head`` while a tied checkpoint ships no such weight, and loading
+    dies with "Missing 1 parameters: language_model.lm_head.weight".
+
+    That failure is easy to misread: oMLX catches it and silently falls back to
+    a text-only engine, so the model loads, answers coherently, and ignores
+    every image — which looks like broken quantization rather than a config bug.
+
+    Hoisting is safe for architectures that do read the nested section; they
+    simply ignore the extra root key. An existing top-level value always wins.
+    """
+    if "tie_word_embeddings" in config:
+        return
+    for section in ("text_config", "language_config", "llm_config"):
+        sub = config.get(section)
+        if isinstance(sub, dict) and "tie_word_embeddings" in sub:
+            config["tie_word_embeddings"] = sub["tie_word_embeddings"]
+            logger.info(
+                "Hoisted tie_word_embeddings=%s from %s to top level "
+                "(mlx-vlm rebuilds text_config from the root config)",
+                sub["tie_word_embeddings"],
+                section,
+            )
+            return
+
+
 def _normalize_mtp_in_config(config: dict) -> None:
     """Zero out MTP layer counts in the output config (in place).
 
@@ -6502,6 +6535,10 @@ def quantize_oq_streaming(
                     )
         except Exception as e:
             logger.debug(f"Could not resolve eos_token_id: {e}")
+    # Keep a nested-only tie_word_embeddings reachable by mlx-vlm, which builds
+    # TextConfig from the root config. Without this the quantized VLM fails to
+    # load and degrades to a text-only engine that silently ignores images.
+    _hoist_tie_word_embeddings(output_config)
     quant_info = dict(quantization_config)
     for key, val in per_layer_config.items():
         quant_info[key] = val
@@ -8794,6 +8831,10 @@ def _build_streaming_proxy_for_sensitivity(
         output_config.pop(temp_key, None)
     if not preserve_mtp:
         _normalize_mtp_in_config(output_config)
+    # Keep a nested-only tie_word_embeddings reachable by mlx-vlm, which builds
+    # TextConfig from the root config. Without this the quantized VLM fails to
+    # load and degrades to a text-only engine that silently ignores images.
+    _hoist_tie_word_embeddings(output_config)
     quant_info = dict(quantization_config)
     for key, val in per_layer_config.items():
         quant_info[key] = val
