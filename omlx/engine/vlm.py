@@ -377,10 +377,17 @@ def _wrap_from_pretrained_with_pil_image_processor(cls):
     cls.from_pretrained = patched
 
 
-def _build_processor_via_pil_image_processor(cls, path, **kwargs):
+def _build_processor_via_pil_image_processor(
+    cls, path, extra_init_kwargs=None, **kwargs
+):
     """Construct a ProcessorMixin instance using transformers' PIL-backend
     image processor (looked up via ``IMAGE_PROCESSOR_MAPPING_NAMES``) instead
-    of the torch-gated ``AutoImageProcessor``."""
+    of the torch-gated ``AutoImageProcessor``.
+
+    ``extra_init_kwargs`` carries processor-level settings read from the
+    checkpoint (e.g. ``image_seq_len``); see
+    ``_processor_init_kwargs_from_config``.
+    """
     from transformers import AutoTokenizer
     from transformers.models.auto.auto_mappings import IMAGE_PROCESSOR_MAPPING_NAMES
 
@@ -456,6 +463,38 @@ def _build_processor_via_pil_image_processor(cls, path, **kwargs):
     processor_kwargs = {"image_processor": image_processor, "tokenizer": tokenizer}
     if feature_extractor is not None:
         processor_kwargs["feature_extractor"] = feature_extractor
+    if extra_init_kwargs:
+        processor_kwargs.update(extra_init_kwargs)
+
+    # Fill required sub-processor slots we have no torch-free source for, e.g.
+    # ``SmolVLMProcessor.__init__`` requires ``video_processor`` positionally.
+    # Video is unsupported in the torch-free path anyway (AutoVideoProcessor is
+    # torchvision-gated, see _patch_video_processor_bug), so None is correct
+    # rather than merely convenient.
+    try:
+        params = inspect.signature(cls.__init__).parameters
+    except (TypeError, ValueError):
+        params = {}
+    for name, param in params.items():
+        if name == "self" or name in processor_kwargs:
+            continue
+        if param.default is not inspect.Parameter.empty:
+            continue
+        if param.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            continue
+        if name in _SUB_PROCESSOR_SLOTS:
+            processor_kwargs[name] = None
+
+    # Stock AutoProcessor puts chat_template.jinja on the processor as well as
+    # the tokenizer. Mirror that so callers can template off the processor
+    # directly instead of relying on a tokenizer fallback.
+    if "chat_template" in params and "chat_template" not in processor_kwargs:
+        template = getattr(tokenizer, "chat_template", None)
+        if template:
+            processor_kwargs["chat_template"] = template
 
     return cls(**processor_kwargs)
 
@@ -480,6 +519,169 @@ def _resolve_pil_image_processor_class(ip_type, mapping_names):
         if candidate is not None and not getattr(candidate, "is_dummy", False):
             return candidate
     return None
+
+
+# Processor __init__ parameters that hold sub-processors rather than plain
+# settings. Never populated from config JSON.
+_SUB_PROCESSOR_SLOTS = frozenset(
+    {
+        "image_processor",
+        "tokenizer",
+        "video_processor",
+        "feature_extractor",
+        "audio_processor",
+        "chat_template",
+    }
+)
+
+_torch_free_auto_processor_patched = False
+
+
+def _read_processor_config_key(path, key):
+    """Read a top-level key from processor_config.json / preprocessor_config.json."""
+    for fname in ("processor_config.json", "preprocessor_config.json"):
+        cfg_path = Path(path) / fname
+        if not cfg_path.exists():
+            continue
+        try:
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        value = cfg.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _resolve_processor_class(path):
+    """Resolve the concrete ``ProcessorMixin`` class a checkpoint declares.
+
+    idefics3/smolvlm checkpoints name it in ``processor_class`` (e.g.
+    ``Idefics3Processor``, ``SmolVLMProcessor``). Returns None when absent or
+    unknown to transformers, in which case the caller should re-raise the
+    original loader error.
+    """
+    name = _read_processor_config_key(path, "processor_class")
+    if not name:
+        return None
+
+    import transformers
+
+    candidate = getattr(transformers, name, None)
+    if candidate is None or getattr(candidate, "is_dummy", False):
+        return None
+    return candidate
+
+
+def _processor_init_kwargs_from_config(cls, path):
+    """Processor-level scalar settings from the checkpoint's config JSON.
+
+    Only keys that appear in ``cls.__init__`` are forwarded. This matters for
+    correctness, not just fidelity: ``Idefics3Processor``/``SmolVLMProcessor``
+    default ``image_seq_len`` to 169, while granite-docling and SmolDocling
+    declare 64 (SmolVLM2 declares 81). Taking the default would expand each
+    image into the wrong number of placeholder tokens.
+    """
+    try:
+        params = inspect.signature(cls.__init__).parameters
+    except (TypeError, ValueError):
+        return {}
+
+    merged: dict[str, Any] = {}
+    # processor_config.json is the more specific source, so it is read last.
+    for fname in ("preprocessor_config.json", "processor_config.json"):
+        cfg_path = Path(path) / fname
+        if not cfg_path.exists():
+            continue
+        try:
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        for key, value in cfg.items():
+            if key in _SUB_PROCESSOR_SLOTS or key not in params:
+                continue
+            if isinstance(value, (dict, list)):
+                continue
+            merged[key] = value
+    return merged
+
+
+def _is_torch_free_processor_gate(exc):
+    """True when ``exc`` is transformers refusing to build an image processor
+    for lack of torch/torchvision, rather than a genuine checkpoint problem."""
+    msg = str(exc)
+    if isinstance(exc, ImportError):
+        return "Torchvision" in msg or "PyTorch" in msg
+    return "Unrecognized image processor" in msg
+
+
+def _patch_torch_free_auto_processor():
+    """Route ``AutoProcessor`` around torch-gated image processors.
+
+    ``_patch_torch_free_image_processor`` only covers mlx-vlm's own processor
+    classes (glm_ocr, dots_ocr). Checkpoints whose processor lives in
+    transformers itself — idefics3 and smolvlm, i.e. granite-docling,
+    SmolDocling and SmolVLM2 — are loaded by mlx-vlm's ``load_processor`` via
+    ``AutoProcessor.from_pretrained``, which never touches those classes. They
+    fail deeper, with ``ValueError: Unrecognized image processor``, once every
+    candidate image-processor class resolves to a torchvision-gated dummy.
+
+    ``AutoProcessor`` is the seam to wrap: the top-level
+    ``transformers.AutoImageProcessor`` is itself a dummy, while the copy
+    reached through transformers' lazy-module indirection is not, so wrapping
+    the image-processor class directly is unreliable.
+
+    The fallback only runs after a genuine failure, so checkpoints transformers
+    can load are unaffected.
+    """
+    global _torch_free_auto_processor_patched
+    if _torch_free_auto_processor_patched:
+        return
+
+    try:
+        import transformers
+    except ImportError:
+        return
+
+    if not getattr(transformers.AutoImageProcessor, "is_dummy", False):
+        # torch+torchvision available, AutoProcessor works as-is.
+        _torch_free_auto_processor_patched = True
+        return
+
+    auto_cls = transformers.AutoProcessor
+    if getattr(auto_cls.from_pretrained, "_omlx_torch_free_patched", False):
+        _torch_free_auto_processor_patched = True
+        return
+
+    orig = auto_cls.from_pretrained
+
+    @classmethod
+    def patched(cls_inner, path, **kwargs):
+        try:
+            return orig(path, **kwargs)
+        except (ImportError, ValueError) as exc:
+            if not _is_torch_free_processor_gate(exc):
+                raise
+            concrete = _resolve_processor_class(path)
+            if concrete is None:
+                # Nothing better to offer; the original error is the clearer one.
+                raise
+            logger.info(
+                "AutoProcessor unavailable (torch-free env); building %s via "
+                "PIL image processor for %s",
+                concrete.__name__,
+                path,
+            )
+            extra = _processor_init_kwargs_from_config(concrete, path)
+            return _build_processor_via_pil_image_processor(
+                concrete, str(path), extra_init_kwargs=extra, **kwargs
+            )
+
+    patched.__func__._omlx_torch_free_patched = True
+    auto_cls.from_pretrained = patched
+    _torch_free_auto_processor_patched = True
 
 
 # Mapping from feature_extractor_type to (module, class) locations in mlx_vlm
@@ -1652,6 +1854,7 @@ class VLMBatchedEngine(BaseEngine):
         def _load_vlm_sync():
             _patch_video_processor_bug()
             _patch_torch_free_image_processor()
+            _patch_torch_free_auto_processor()
             apply_pixtral_torch_free_patch()
             with (
                 _strip_audio_config_if_orphaned(Path(self._model_name)),
