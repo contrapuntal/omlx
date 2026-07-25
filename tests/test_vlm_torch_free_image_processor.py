@@ -24,18 +24,23 @@ import pytest
 from omlx.engine import vlm as vlm_mod
 from omlx.engine.vlm import (
     _build_processor_via_pil_image_processor,
+    _patch_torch_free_auto_processor,
     _patch_torch_free_image_processor,
+    _processor_init_kwargs_from_config,
     _resolve_pil_image_processor_class,
+    _resolve_processor_class,
     _wrap_from_pretrained_with_pil_image_processor,
 )
 
 
 @pytest.fixture(autouse=True)
 def reset_patched_flag():
-    """Reset module-level guard so each test can re-run the patch."""
+    """Reset module-level guards so each test can re-run the patches."""
     vlm_mod._torch_free_ip_patched = False
+    vlm_mod._torch_free_auto_processor_patched = False
     yield
     vlm_mod._torch_free_ip_patched = False
+    vlm_mod._torch_free_auto_processor_patched = False
 
 
 # ---------------------------------------------------------------------------
@@ -357,3 +362,231 @@ def test_patch_wraps_target_processors():
     assert getattr(
         FakeDotsVLProcessor.from_pretrained, "_omlx_torch_free_patched", False
     )
+
+
+# ---------------------------------------------------------------------------
+# _resolve_processor_class / _processor_init_kwargs_from_config
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_processor_class_from_processor_config(tmp_path):
+    """``processor_class`` in processor_config.json resolves to a transformers class."""
+    (tmp_path / "processor_config.json").write_text(
+        json.dumps({"processor_class": "FakeIdefics3Processor", "image_seq_len": 64})
+    )
+
+    fake_cls = type("FakeIdefics3Processor", (), {})
+    fake_transformers = types.ModuleType("transformers")
+    fake_transformers.FakeIdefics3Processor = fake_cls
+
+    with patch.dict(sys.modules, {"transformers": fake_transformers}):
+        assert _resolve_processor_class(str(tmp_path)) is fake_cls
+
+
+def test_resolve_processor_class_reads_preprocessor_config(tmp_path):
+    """granite-docling/SmolDocling declare processor_class in preprocessor_config.json."""
+    (tmp_path / "preprocessor_config.json").write_text(
+        json.dumps(
+            {
+                "image_processor_type": "Idefics3ImageProcessor",
+                "processor_class": "FakeProc",
+            }
+        )
+    )
+
+    fake_cls = type("FakeProc", (), {})
+    fake_transformers = types.ModuleType("transformers")
+    fake_transformers.FakeProc = fake_cls
+
+    with patch.dict(sys.modules, {"transformers": fake_transformers}):
+        assert _resolve_processor_class(str(tmp_path)) is fake_cls
+
+
+def test_resolve_processor_class_returns_none_when_absent(tmp_path):
+    assert _resolve_processor_class(str(tmp_path)) is None
+
+
+def test_processor_init_kwargs_honours_checkpoint_image_seq_len(tmp_path):
+    """Regression guard: Idefics3Processor defaults image_seq_len to 169, but
+    granite-docling / SmolDocling declare 64. Silently taking the default would
+    emit the wrong number of image tokens."""
+
+    class FakeProcessorCls:
+        def __init__(self, image_processor, tokenizer=None, image_seq_len: int = 169):
+            pass
+
+    (tmp_path / "processor_config.json").write_text(
+        json.dumps({"image_seq_len": 64, "processor_class": "FakeProcessorCls"})
+    )
+
+    kwargs = _processor_init_kwargs_from_config(FakeProcessorCls, str(tmp_path))
+    assert kwargs == {"image_seq_len": 64}
+
+
+def test_processor_init_kwargs_skips_unknown_and_subprocessor_keys(tmp_path):
+    """Only names in the target __init__ signature are forwarded, and
+    sub-processor slots are never filled from config."""
+
+    class FakeProcessorCls:
+        def __init__(self, image_processor, tokenizer=None, image_seq_len: int = 169):
+            pass
+
+    (tmp_path / "processor_config.json").write_text(
+        json.dumps(
+            {
+                "image_seq_len": 64,
+                "processor_class": "FakeProcessorCls",
+                "image_processor": {"image_processor_type": "Foo"},
+                "totally_unknown_key": 5,
+            }
+        )
+    )
+
+    kwargs = _processor_init_kwargs_from_config(FakeProcessorCls, str(tmp_path))
+    assert kwargs == {"image_seq_len": 64}
+
+
+# ---------------------------------------------------------------------------
+# _patch_torch_free_auto_processor
+# ---------------------------------------------------------------------------
+
+
+def _dummy_transformers_module(auto_processor_cls):
+    """transformers stand-in whose AutoImageProcessor looks torch-gated."""
+    mod = types.ModuleType("transformers")
+    mod.AutoImageProcessor = type("DummyAIP", (), {"is_dummy": True})
+    mod.AutoProcessor = auto_processor_cls
+    return mod
+
+
+def test_auto_processor_falls_back_on_unrecognized_image_processor(tmp_path):
+    """The idefics3/smolvlm failure: AutoProcessor.from_pretrained raises
+    ValueError('Unrecognized image processor ...') because every candidate class
+    is a torchvision-gated dummy. That must route to the PIL builder."""
+    sentinel = object()
+
+    class FakeAutoProcessor:
+        @classmethod
+        def from_pretrained(cls, path, **kwargs):
+            raise ValueError(
+                f"Unrecognized image processor in {path}. Should have a "
+                "`image_processor_type` key in its preprocessor_config.json"
+            )
+
+    fake_transformers = _dummy_transformers_module(FakeAutoProcessor)
+    concrete = type("FakeIdefics3Processor", (), {})
+
+    with patch.dict(sys.modules, {"transformers": fake_transformers}):
+        _patch_torch_free_auto_processor()
+        with patch.object(
+            vlm_mod, "_resolve_processor_class", return_value=concrete
+        ), patch.object(
+            vlm_mod,
+            "_build_processor_via_pil_image_processor",
+            return_value=sentinel,
+        ) as builder:
+            out = FakeAutoProcessor.from_pretrained(str(tmp_path))
+
+    assert out is sentinel
+    builder.assert_called_once()
+
+
+def test_auto_processor_falls_back_on_torchvision_import_error(tmp_path):
+    """Some checkpoints surface the gate as ImportError instead of ValueError."""
+    sentinel = object()
+
+    class FakeAutoProcessor:
+        @classmethod
+        def from_pretrained(cls, path, **kwargs):
+            raise ImportError(
+                "AutoImageProcessor requires the Torchvision library but it was not found"
+            )
+
+    fake_transformers = _dummy_transformers_module(FakeAutoProcessor)
+    concrete = type("FakeIdefics3Processor", (), {})
+
+    with patch.dict(sys.modules, {"transformers": fake_transformers}):
+        _patch_torch_free_auto_processor()
+        with patch.object(
+            vlm_mod, "_resolve_processor_class", return_value=concrete
+        ), patch.object(
+            vlm_mod,
+            "_build_processor_via_pil_image_processor",
+            return_value=sentinel,
+        ):
+            out = FakeAutoProcessor.from_pretrained(str(tmp_path))
+
+    assert out is sentinel
+
+
+def test_auto_processor_reraises_unrelated_value_error(tmp_path):
+    """A ValueError that isn't the torch-free gate must propagate untouched."""
+
+    class FakeAutoProcessor:
+        @classmethod
+        def from_pretrained(cls, path, **kwargs):
+            raise ValueError("checkpoint is corrupt")
+
+    fake_transformers = _dummy_transformers_module(FakeAutoProcessor)
+
+    with patch.dict(sys.modules, {"transformers": fake_transformers}):
+        _patch_torch_free_auto_processor()
+        with pytest.raises(ValueError, match="checkpoint is corrupt"):
+            FakeAutoProcessor.from_pretrained(str(tmp_path))
+
+
+def test_auto_processor_reraises_when_processor_class_unresolvable(tmp_path):
+    """If we cannot determine the concrete processor class, surface the original
+    error rather than a confusing secondary one."""
+
+    class FakeAutoProcessor:
+        @classmethod
+        def from_pretrained(cls, path, **kwargs):
+            raise ValueError("Unrecognized image processor in x")
+
+    fake_transformers = _dummy_transformers_module(FakeAutoProcessor)
+
+    with patch.dict(sys.modules, {"transformers": fake_transformers}):
+        _patch_torch_free_auto_processor()
+        with patch.object(vlm_mod, "_resolve_processor_class", return_value=None):
+            with pytest.raises(ValueError, match="Unrecognized image processor"):
+                FakeAutoProcessor.from_pretrained(str(tmp_path))
+
+
+def test_auto_processor_patch_noop_when_not_dummy():
+    """With torchvision installed the wrapper must not be installed at all."""
+
+    class FakeAutoProcessor:
+        @classmethod
+        def from_pretrained(cls, path, **kwargs):
+            return "real"
+
+    fake_transformers = types.ModuleType("transformers")
+    fake_transformers.AutoImageProcessor = type("RealAIP", (), {})
+    fake_transformers.AutoProcessor = FakeAutoProcessor
+
+    with patch.dict(sys.modules, {"transformers": fake_transformers}):
+        _patch_torch_free_auto_processor()
+
+    assert not getattr(
+        FakeAutoProcessor.from_pretrained, "_omlx_torch_free_patched", False
+    )
+
+
+def test_auto_processor_patch_is_idempotent():
+    """Re-running the patch must not stack wrappers."""
+
+    class FakeAutoProcessor:
+        @classmethod
+        def from_pretrained(cls, path, **kwargs):
+            return "ok"
+
+    fake_transformers = _dummy_transformers_module(FakeAutoProcessor)
+
+    with patch.dict(sys.modules, {"transformers": fake_transformers}):
+        _patch_torch_free_auto_processor()
+        first = FakeAutoProcessor.from_pretrained.__func__
+        vlm_mod._torch_free_auto_processor_patched = False
+        _patch_torch_free_auto_processor()
+
+    assert FakeAutoProcessor.from_pretrained.__func__ is first
