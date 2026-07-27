@@ -62,18 +62,29 @@ def _install_vendor_namespace() -> None:
     import mlx_vlm.models
     import mlx_vlm.tool_parsers
 
-    _append_package_path(mlx_vlm, _VENDOR_MLX_VLM)
-    _append_package_path(mlx_vlm.models, _VENDOR_MLX_VLM / "models")
-    _append_package_path(mlx_vlm.tool_parsers, _VENDOR_MLX_VLM / "tool_parsers")
+    _prefer_package_path(mlx_vlm, _VENDOR_MLX_VLM)
+    _prefer_package_path(mlx_vlm.models, _VENDOR_MLX_VLM / "models")
+    _prefer_package_path(mlx_vlm.tool_parsers, _VENDOR_MLX_VLM / "tool_parsers")
 
 
-def _append_package_path(package: Any, path: Path) -> None:
+def _prefer_package_path(package: Any, path: Path) -> None:
+    """Put the vendored tree ahead of whatever mlx-vlm ships.
+
+    This has to take precedence, not fall back. mlx-vlm reintroduced a native
+    minimax_m3_vl in #1374, but that one has no `msa` submodule and no
+    `pack_shared_expert` on TextConfig — the vendored tree is a strict superset
+    carrying oMLX's grouped sparse attention and the oQ shared-expert split.
+    Appended, the thinner native package wins the __path__ scan and the extras
+    become unreachable, which silently drops the custom sparse-attention path
+    on any pin new enough to have native MiniMax.
+    """
     package_path = getattr(package, "__path__", None)
     if package_path is None:
         return
     path_str = str(path)
-    if path_str not in package_path:
-        package_path.append(path_str)
+    if path_str in package_path:
+        package_path.remove(path_str)
+    package_path.insert(0, path_str)
 
 
 def _import_vendor_modules() -> None:
