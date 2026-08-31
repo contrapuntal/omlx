@@ -162,35 +162,31 @@ modelscope = [
     "modelscope>=1.10.0",
 ]
 audio = [
-    # mlx-audio pinned to contrapuntal/mlx-audio fork-main, which is
-    # Blaizzy/mlx-audio main (HEAD a5867d7, 2026-04-23) plus two carry patches:
-    #   - voxtral-eos-token-ids-bypass: fixes Voxtral STT crash on tokenizer
-    #     `eos_token_ids` initialization (re-frames closed upstream PR #450)
-    #   - canary-mlx-converted-checkpoint-support: fixes silent half-decoder
-    #     load on MLX-converted canary checkpoints (alt key naming + already-
-    #     MLX conv layout heuristic)
-    # tts extra: misaki, num2words, spacy, phonemizer-fork, espeakng-loader, sentencepiece
-    # stt extra: sentencepiece — upstream PR #673 stripped tiktoken and
-    #   mistral-common from [stt]; both are pinned directly below so the
-    #   implicit transitive contract no longer matters.
-    # sts extra: tts deps + stt deps + webrtcvad
-    "mlx-audio[tts,stt,sts] @ git+https://github.com/contrapuntal/mlx-audio@52115c0c3c19f2d8180acffa3546f355c3d9df1f",
+    # Immutable companion carry: Blaizzy/mlx-audio main at 9cef816 plus the
+    # tested oMLX Transformers 5.12.1 compatibility range. The companion keeps
+    # model-specific text packages out of shared extras, so oMLX owns the full
+    # dependency contract for the models exposed by `omlx[audio]`.
+    "mlx-audio[tts,stt,sts] @ git+https://github.com/contrapuntal/mlx-audio@a266d8dbd711da71211d45a98c9e3795d30011b9",
     # WebSocket protocol impl for uvicorn (realtime STT endpoint). Pure
     # python; uvicorn's ws="auto" picks it up when installed.
     "wsproto==1.2.0",
-    # mistral-common[audio] is required by Voxtral STT (transformers' processing_voxtral.py
-    # imports `TranscriptionRequest` from it). mlx-audio PR #673 (Apr 23, 2026) silently
-    # removed this from the `[stt]` extra; pin it here so we don't depend on the upstream
-    # `[tts]` extra continuing to declare it. Floor is 1.11.0 because transformers
-    # 5.5.x imports `ReasoningEffort` from mistral_common which only exists from 1.11.
+    # Kokoro and KittenTTS text frontends are intentionally model-specific in
+    # mlx-audio; oMLX's all-model audio extra must install them explicitly.
+    "misaki>=0.9.4",
+    "num2words>=0.5.14",
+    "spacy>=3.8.4",
+    "phonemizer-fork>=3.3.2",
+    "espeakng-loader>=0.2.4",
+    # Keep runtime requirements explicit even when core oMLX or another extra
+    # currently supplies them, so upstream reshuffles cannot silently change
+    # the public `omlx[audio]` contract.
+    "python-multipart>=0.0.5",
+    # Voxtral's Transformers processor imports TranscriptionRequest, and
+    # Transformers 5.x needs ReasoningEffort (mistral-common 1.11+).
     "mistral-common[audio]>=1.11.0",
-    # torch is required by Voxtral STT specifically: transformers' WhisperFeatureExtractor
-    # hardcodes `return_tensors='pt'` in its Voxtral processor. Other ASR/STT models in
-    # mlx-audio do not need torch. ~2GB.
+    # Voxtral hardcodes return_tensors="pt" in WhisperFeatureExtractor.
     "torch>=2.0.0",
-    # librosa is required by transformers' audio_utils.load_audio_as which Voxtral's
-    # processor calls. mlx-audio PR #662 (Apr 21, 2026) removed librosa from its own
-    # transitive deps; pin it here so Voxtral STT doesn't break when mlx-audio drops it.
+    # Voxtral's processor uses transformers.audio_utils.load_audio_as.
     "librosa>=0.10.0",
 ]
 paroquant = [
