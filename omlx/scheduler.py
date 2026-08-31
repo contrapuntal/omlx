@@ -4540,7 +4540,7 @@ class Scheduler:
             return requested
 
         current = self._current_usage_bytes()
-        min_chunk = max(1, self._prefill_min_chunk_tokens)
+        min_chunk = min(requested, max(1, self._prefill_min_chunk_tokens))
         qwen4_flat_overhead = Scheduler._qwen4_prefill_accounting_enabled(self)
         # Conservative per-token peak growth (measured-last / EWMA / static, ×
         # safety) — see _predicted_chunk_transient. Anchored on the most recent
