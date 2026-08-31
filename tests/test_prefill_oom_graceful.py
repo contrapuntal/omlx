@@ -254,6 +254,20 @@ def test_throttle_floors_at_min_chunk_when_over_ceiling():
     assert _call(ns, 2048, kv_len=5000) == 32
 
 
+def test_throttle_never_enlarges_a_tail_below_min_chunk():
+    hard = 40 * _GB
+    ns = _throttle_ctx(
+        current=hard + _GB,
+        hard=hard,
+        samples_bpt=1_000_000,
+        min_chunk=32,
+    )
+    ns._fake_current = hard + _GB
+
+    for requested in range(1, 32):
+        assert _call(ns, requested) == requested
+
+
 def test_throttle_emits_one_info_notice_per_request(caplog):
     """A throttled prefill has to be visible at the default log level.
 

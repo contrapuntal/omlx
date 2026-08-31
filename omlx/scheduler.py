@@ -4285,7 +4285,7 @@ class Scheduler:
             return requested
 
         current = self._current_usage_bytes()
-        min_chunk = max(1, self._prefill_min_chunk_tokens)
+        min_chunk = min(requested, max(1, self._prefill_min_chunk_tokens))
 
         # Conservative per-token peak growth (measured-last / EWMA / static, ×
         # safety) — see _predicted_chunk_transient. Anchored on the most recent
