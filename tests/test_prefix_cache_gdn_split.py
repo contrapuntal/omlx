@@ -623,6 +623,7 @@ def test_scheduler_exact_split_hit_reprefills_only_last_block():
         gdn_ssd_split_enabled=True,
     )
     scheduler._prefix_cache_prepared = set()
+    scheduler._model_has_unreconstructible_cache = MagicMock(return_value=False)
     scheduler._p34_try_adopt_retained_chain = MagicMock(return_value=False)
     scheduler._gdn_split_active = MagicMock(return_value=True)
     scheduler._bypass_hot_cache_under_pressure = MagicMock(return_value=False)
