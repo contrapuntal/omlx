@@ -167,7 +167,12 @@ modelscope = [
     "modelscope>=1.10.0",
 ]
 audio = [
-    # mlx-audio from commit (94c7716, v0.5.7) with tts/stt/sts extras
+    # mlx-audio from commit (94c7716, v0.5.7) with tts/stt/sts extras.
+    # NOTE (2026-10-05 rebase): the contrapuntal/mlx-audio companion pin
+    # (a266d8db, carrying the Voxtral eos-token-ids bypass + canary MLX-layout
+    # fixes) is 120 commits behind v0.5.7, so the upstream pin is kept and only
+    # the dependency contract is carried. Re-pin to the companion only after
+    # it is rebased onto >=94c7716; then re-verify Voxtral/canary at the new pin.
     "mlx-audio[tts,stt,sts] @ git+https://github.com/Blaizzy/mlx-audio@94c7716212b2228f178d2f9c7619a591fd1b0b78",
     # Keep dependencies for existing audio models removed from upstream extras.
     "espeakng-loader>=0.2.4",
@@ -181,6 +186,15 @@ audio = [
     # WebSocket protocol impl for uvicorn (realtime STT endpoint). Pure
     # python; uvicorn's ws="auto" picks it up when installed.
     "wsproto==1.2.0",
+    # Keep runtime requirements explicit even when core oMLX or another extra
+    # currently supplies them, so upstream reshuffles cannot silently change
+    # the public `omlx[audio]` contract.
+    "python-multipart>=0.0.5",
+    # Voxtral's Transformers processor imports TranscriptionRequest, and
+    # Transformers 5.x needs ReasoningEffort (mistral-common 1.11+).
+    "mistral-common[audio]>=1.11.0",
+    # Voxtral hardcodes return_tensors="pt" in WhisperFeatureExtractor (~2GB).
+    "torch>=2.0.0",
 ]
 paroquant = [
     # ParoQuant runtime loader for paroquant-quantized models. Installed
