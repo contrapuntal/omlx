@@ -24,6 +24,7 @@ from .type_handlers import (
     RotatingKVCacheHandler,
     SizedArraysCache,
 )
+from .unlimited_ocr_handler import RingSlidingKVCacheHandler
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,8 @@ class CacheTypeRegistry:
         "QSAKVCache": CacheType.QWEN4_QSA_KVCACHE,
         "QSAQuantizedKVCache": CacheType.QWEN4_QSA_QUANTIZED_KVCACHE,
         "BatchQSAKVCache": CacheType.QWEN4_BATCH_QSA_KVCACHE,
+        "RingSlidingKVCache": CacheType.RING_SLIDING_KVCACHE,
+        "OMLXRingSlidingKVCache": CacheType.RING_SLIDING_KVCACHE,
     }
 
     # Default handler instance
@@ -272,6 +275,7 @@ def _initialize_default_handlers() -> None:
     CacheTypeRegistry.register(Qwen4QSAKVCacheHandler())
     CacheTypeRegistry.register(Qwen4QSAQuantizedKVCacheHandler())
     CacheTypeRegistry.register(Qwen4BatchQSAKVCacheHandler())
+    CacheTypeRegistry.register(RingSlidingKVCacheHandler())
 
 
 # Initialize handlers when module is imported

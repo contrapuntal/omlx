@@ -822,6 +822,19 @@ class BlockAwarePrefixCache(CacheManager):
                 layer_state.get("meta_state", ()) for layer_state in cache_data
             ]
 
+        if is_tensor_data:
+            # The OCR handler exports only intact prompt KV, not overwritten
+            # decode slots. Do not label it with the full generated sequence
+            # or allocate blocks past its valid prefix (including partials).
+            for idx, type_name in enumerate(layer_cache_types or []):
+                if type_name in ("RingSlidingKVCache", "OMLXRingSlidingKVCache"):
+                    keys = cache_data[idx]["state"][0]
+                    if keys is None:
+                        return None
+                    tokens = tokens[: keys.shape[2]]
+            if not tokens:
+                return None
+
         split_gdn_layout = self._gdn_split_layout_supported(layer_cache_types)
 
         # Get or create block table
@@ -3377,6 +3390,41 @@ class BlockAwarePrefixCache(CacheManager):
                     cache_type_name = layer_cache_types[layer_idx]
 
                 handler = CacheTypeRegistry.get_handler_by_class_name(cache_type_name)
+
+                if cache_type_name in (
+                    "RingSlidingKVCache", "OMLXRingSlidingKVCache"
+                ):
+                    # A deduplicated chain may start with a valid prefill
+                    # capture and end with old overwritten decode-ring slots.
+                    # Validate every block, not just the first block's metadata
+                    # passed to reconstruct_cache for ordinary sliceable KV.
+                    window = None
+                    prefix_end = 0
+                    for block_idx, data in enumerate(all_block_data):
+                        metadata = all_block_meta_states[block_idx]
+                        block_window, stored_length = handler.validate_prefix_metadata(
+                            metadata[layer_idx] if metadata else None
+                        )
+                        keys, values = data[layer_idx]
+                        expected_length = self.paged_cache.blocks[
+                            block_table.block_ids[block_idx]
+                        ].token_count
+                        if (
+                            keys is None
+                            or values is None
+                            or keys.ndim != 4
+                            or values.ndim != 4
+                            or keys.shape[:3] != values.shape[:3]
+                            or keys.shape[0] != 1
+                            or keys.shape[2] != expected_length
+                        ):
+                            raise ValueError("Invalid Unlimited-OCR prefix block length")
+                        prefix_end += expected_length
+                        if stored_length < prefix_end or (
+                            window is not None and block_window != window
+                        ):
+                            raise ValueError("Incompatible Unlimited-OCR prefix blocks")
+                        window = block_window
 
                 # === CacheList: dedicated branch (before standard 2-tuple unpack) ===
                 if cache_type_name == "CacheList":

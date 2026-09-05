@@ -1782,6 +1782,11 @@ class Scheduler:
                 "Llama 4 detected; serializing requests because ChunkedKVCache "
                 "does not support multi-row batching yet"
             )
+        if getattr(model, "requires_serial_decode", False) is True:
+            logger.info(
+                "Unlimited-OCR detected; serializing requests to preserve "
+                "native ring-cache attention"
+            )
 
         # Load additional EOS tokens from generation_config.json.
         # Some models (e.g. GLM-4.6V) define multiple EOS tokens there
@@ -3288,6 +3293,8 @@ class Scheduler:
             return False
 
         def _ok(c: Any) -> bool:
+            if type(c).__name__ in ("RingSlidingKVCache", "OMLXRingSlidingKVCache"):
+                return False
             if isinstance(c, KVCache):
                 return True
             if isinstance(c, ArraysCache):
@@ -8033,6 +8040,8 @@ class Scheduler:
                         "QSAKVCache",
                         "QSAQuantizedKVCache",
                         "BatchQSAKVCache",
+                        "RingSlidingKVCache",
+                        "OMLXRingSlidingKVCache",
                     ):
                         state = handler.serialize_state(layer_cache)
                         meta = handler.serialize_meta_state(layer_cache)
@@ -8542,6 +8551,16 @@ class Scheduler:
                     reconstructed = self.block_aware_cache.reconstruct_cache(
                         block_table
                     )
+                validate_prefix = getattr(self.model, "is_prefix_cache_compatible", None)
+                if (
+                    reconstructed
+                    and callable(validate_prefix)
+                    and not validate_prefix(reconstructed)
+                ):
+                    logger.warning(
+                        "Discarding incompatible prefix cache for %s", request.request_id
+                    )
+                    reconstructed = None
                 if reconstructed:
                     request.prompt_cache = reconstructed
                     request.block_table = block_table
@@ -9794,7 +9813,11 @@ class Scheduler:
     def _effective_max_num_seqs(self) -> int:
         """Current admission cap, narrowed for models that require serial decode."""
         self._refresh_generation_overflow_recovery_ids()
-        if self._serialize_llama4_requests or self._generation_overflow_recovery_ids:
+        if (
+            self._serialize_llama4_requests
+            or self._generation_overflow_recovery_ids
+            or getattr(self.model, "requires_serial_decode", False) is True
+        ):
             return 1
         return max(1, self.config.max_num_seqs)
 

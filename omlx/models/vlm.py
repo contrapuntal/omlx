@@ -174,6 +174,23 @@ class VLMModelAdapter(nn.Module):
             return self._language_model.args
         return self.config
 
+    @property
+    def requires_serial_decode(self) -> bool:
+        """Unlimited-OCR's native ring cache has no safe multi-row conversion."""
+        return self.model_type == "unlimited-ocr"
+
+    def is_prefix_cache_compatible(self, caches: List[Any]) -> bool:
+        """Reject legacy full-KV OCR prefixes, including text-only requests."""
+        if self.model_type != "unlimited-ocr":
+            return True
+        expected = self.make_cache()
+        return len(caches) == len(expected) and all(
+            type(actual) is type(fresh)
+            and getattr(actual, "window_size", None)
+            == getattr(fresh, "window_size", None)
+            for actual, fresh in zip(caches, expected)
+        )
+
     def make_cache(self) -> List[Any]:
         """
         Create KV cache using the language model's make_cache().
@@ -183,7 +200,17 @@ class VLMModelAdapter(nn.Module):
         per layer if the language model doesn't define make_cache().
         """
         if hasattr(self._language_model, "make_cache"):
-            return self._language_model.make_cache()
+            caches = self._language_model.make_cache()
+            if self.requires_serial_decode:
+                from ..cache.unlimited_ocr import OMLXRingSlidingKVCache
+
+                caches = [
+                    OMLXRingSlidingKVCache(c.window_size)
+                    if type(c).__name__ == "RingSlidingKVCache"
+                    else c
+                    for c in caches
+                ]
+            return caches
         from mlx_lm.models.cache import KVCache
         return [KVCache() for _ in range(len(self.layers))]
 
