@@ -3448,6 +3448,13 @@ class Scheduler:
         ]
         return all(routes) if routes else predicted
 
+    @staticmethod
+    def _set_ring_prefill_end(cache: list[Any], remaining_tokens: int) -> None:
+        """Keep size-one prompt chunks out of the native OCR decode ring."""
+        for layer in cache:
+            if type(layer).__name__ == "OMLXRingSlidingKVCache":
+                layer.set_prefill_end(layer.offset + max(0, remaining_tokens - 1))
+
     def _do_external_prefill(
         self,
         request: "Request",
@@ -3499,6 +3506,8 @@ class Scheduler:
             prompt_cache = existing_cache
         else:
             prompt_cache = make_prompt_cache(self.model)
+
+        self._set_ring_prefill_end(prompt_cache, n_tokens)
 
         # Fresh TurboQuant requests run fp16 during the cold prefill loop and
         # are quantized once at the end. Restored TurboQuant prefix caches stay
@@ -5308,6 +5317,7 @@ class Scheduler:
             if existing_cache is not None
             else make_prompt_cache(self.model)
         )
+        self._set_ring_prefill_end(prompt_cache, len(tokens))
 
         block_size = self.config.paged_cache_block_size
         boundary_enabled = (

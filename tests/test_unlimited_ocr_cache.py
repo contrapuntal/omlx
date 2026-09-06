@@ -280,6 +280,152 @@ class TinyRingLanguageModel:
         return mx.broadcast_to(mx.array([0.0, 0.0, 10.0, 0.0]), (*input_ids.shape, 4))
 
 
+class RetentionLogitsModel(TinyRingLanguageModel):
+    """Make an early ring overwrite observable in generated token IDs."""
+
+    def __init__(self):
+        self.boundaries = []
+
+    def make_cache(self):
+        from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
+
+        return [RingSlidingKVCache(128)]
+
+    def __call__(self, input_ids, cache=None, **kwargs):
+        tensor = input_ids.astype(mx.float32)[:, None, :, None]
+        keys, _ = cache[0].update_and_fetch(tensor, tensor)
+        self.boundaries.append(cache[0].prefill_length)
+        token = 3 + int(mx.sum(keys).item()) % 20
+        logits = mx.where(mx.arange(32) == token, 10.0, -10.0)
+        return mx.broadcast_to(logits, (*input_ids.shape, 32))
+
+
+@pytest.mark.parametrize(
+    "prompt_length,stored_length,step_size,chunked",
+    [
+        (8, 8, 2048, False),  # exact hit trims to N-1
+        (9, 8, 2048, False),  # one uncached token is kickoff, not prefill
+        (8, 6, 2048, False),  # two uncached tokens split into prefill + kickoff
+        (8, 0, 2, False),  # synchronous prefill ends in a single-token chunk
+        (8, 0, 2, True),  # the same tail across scheduler step() calls
+        (8, 4, 2, True),  # chunked continuation from a partial prefix
+        (8, 0, 1, True),  # every prefill chunk is a single token
+    ],
+)
+def test_scheduler_prefill_boundary_matches_cold_past_ring_window(
+    tmp_path,
+    mock_model,
+    mock_tokenizer,
+    prompt_length,
+    stored_length,
+    step_size,
+    chunked,
+):
+    import time
+
+    from omlx.request import Request, SamplingParams
+
+    prompt = list(range(10, 10 + prompt_length))
+
+    def run(label, stored, step, use_chunks):
+        model = adapter()
+        language = RetentionLogitsModel()
+        model._language_model = language
+        scheduler = Scheduler(
+            mock_model,
+            mock_tokenizer,
+            SchedulerConfig(prefill_step_size=step, chunked_prefill=use_chunks),
+        )
+        scheduler.model = model
+        prefix, paged, ssd = make_ssd_stack(tmp_path / label, 2)
+        scheduler.block_aware_cache = prefix
+        scheduler.paged_cache_manager = paged
+        try:
+            if stored:
+                cache = model.make_cache()[0]
+                append(cache, prompt[:stored])
+                payload, config = scheduler._extract_cache_states([cache])
+                table = prefix.store_cache(
+                    "seed", prompt[:stored], payload, model_cache_config=config
+                )
+                assert table is not None
+                paged.delete_block_table("seed")
+            request = Request(
+                label, prompt, SamplingParams(max_tokens=132, temperature=0)
+            )
+            scheduler.add_request(request)
+            scheduler._prepare_prefix_cache_for_request(request)
+            assert request.cached_tokens == (
+                stored - 1 if stored == prompt_length else stored
+            )
+            deadline = time.monotonic() + 10
+            while not request.is_finished() and time.monotonic() < deadline:
+                scheduler.step()
+                # Chunked prefill yields to the scheduler's fairness timer.
+                if not request.is_finished():
+                    time.sleep(0.001)
+            assert request.is_finished()
+            assert len(request.output_token_ids) == 132
+            assert request.get_finish_reason() == "length"
+            assert all(b.ref_count == 0 for b in paged.blocks if not b.is_null)
+            return request.output_token_ids, language.boundaries
+        finally:
+            if scheduler.batch_generator is not None:
+                scheduler.batch_generator.close()
+            ssd.close()
+
+    cold, _ = run("cold-reference", 0, 2048, False)
+    actual, boundaries = run("candidate", stored_length, step_size, chunked)
+    # Preserve this serving engine's N-1 kickoff, not native full-prompt parity.
+    assert {b for b in boundaries if b is not None} == {prompt_length - 1}
+    assert actual == cold
+
+
+def test_explicit_prefill_end_survives_singletons_and_resume():
+    cache = adapter().make_cache()[0]
+    cache.set_prefill_end(4)
+    append(cache, [0, 1])
+    # Resume after a scheduler yield, still before the same absolute boundary.
+    cache.set_prefill_end(4)
+    append(cache, [2])
+    assert cache.prefill_length is None
+    assert cache.is_trimmable()
+    append(cache, [3])
+    assert cache.prefill_length is None
+    for token in range(4, 12):
+        values = append(cache, [token])
+    assert cache.prefill_length == 4
+    assert values == [0, 1, 2, 3, 10, 11]
+
+
+def test_prefill_end_rejects_crossing_or_reopening_decode():
+    cache = adapter().make_cache()[0]
+    with pytest.raises(ValueError):
+        cache.set_prefill_end(-1)
+    cache.set_prefill_end(2)
+    with pytest.raises(ValueError):
+        append(cache, [0, 1, 2])
+    assert cache.offset == 0
+    append(cache, [0, 1])
+    with pytest.raises(ValueError):
+        cache.set_prefill_end(1)
+    append(cache, [2])
+    with pytest.raises(ValueError):
+        cache.set_prefill_end(5)
+
+
+def test_empty_filter_discards_request_prefill_end():
+    cache = adapter().make_cache()[0]
+    cache.set_prefill_end(100)
+    append(cache, [0, 1])
+    cache.filter([])
+    append(cache, [10, 11])
+    for token in range(12, 18):
+        values = append(cache, [token])
+    assert cache.prefill_length == 2
+    assert values == [10, 11, 16, 17]
+
+
 def test_guard_refuses_native_ring_until_registration(
     monkeypatch, mock_model, mock_tokenizer
 ):
