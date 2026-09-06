@@ -3507,7 +3507,7 @@ class Scheduler:
         else:
             prompt_cache = make_prompt_cache(self.model)
 
-        self._set_ring_prefill_end(prompt_cache, n_tokens)
+        Scheduler._set_ring_prefill_end(prompt_cache, n_tokens)
 
         # Fresh TurboQuant requests run fp16 during the cold prefill loop and
         # are quantized once at the end. Restored TurboQuant prefix caches stay
@@ -5317,7 +5317,7 @@ class Scheduler:
             if existing_cache is not None
             else make_prompt_cache(self.model)
         )
-        self._set_ring_prefill_end(prompt_cache, len(tokens))
+        Scheduler._set_ring_prefill_end(prompt_cache, len(tokens))
 
         block_size = self.config.paged_cache_block_size
         boundary_enabled = (

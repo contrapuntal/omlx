@@ -828,6 +828,9 @@ class BlockAwarePrefixCache(CacheManager):
             # or allocate blocks past its valid prefix (including partials).
             for idx, type_name in enumerate(layer_cache_types or []):
                 if type_name in ("RingSlidingKVCache", "OMLXRingSlidingKVCache"):
+                    if idx >= len(cache_data):
+                        # Refuse incomplete captures before allocating blocks.
+                        return None
                     keys = cache_data[idx]["state"][0]
                     if keys is None:
                         return None

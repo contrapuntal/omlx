@@ -205,6 +205,28 @@ def test_ssd_store_and_restore_only_prompt_blocks(
         ssd.close()
 
 
+def test_store_refuses_missing_ring_layer_before_allocating_blocks(
+    tmp_path, mock_model, mock_tokenizer
+):
+    scheduler = Scheduler(mock_model, mock_tokenizer)
+    payload, config = scheduler._extract_cache_states(
+        [make_filled_cache(), make_filled_cache()]
+    )
+    prefix, paged, ssd = make_ssd_stack(tmp_path, 2)
+    try:
+        # The model declares two ring layers, but only the first was captured.
+        table = prefix.store_cache(
+            "incomplete", list(range(12)), payload[:1], model_cache_config=config
+        )
+        assert table is None
+        assert paged.get_block_table("incomplete") is None
+        assert "incomplete" not in prefix._request_tables
+        assert all(b.ref_count == 0 for b in paged.blocks if not b.is_null)
+        assert all(b.block_hash is None for b in paged.blocks if not b.is_null)
+    finally:
+        ssd.close()
+
+
 def test_scheduler_discards_legacy_ocr_prefix(mock_model, mock_tokenizer):
     from unittest.mock import MagicMock
 
