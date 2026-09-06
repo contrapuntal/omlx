@@ -227,6 +227,95 @@ def test_store_refuses_missing_ring_layer_before_allocating_blocks(
         ssd.close()
 
 
+@pytest.mark.parametrize("with_config", [False, True])
+@pytest.mark.parametrize("layer_idx", [0, 1])
+@pytest.mark.parametrize(
+    "malformed_payload",
+    [
+        pytest.param(lambda k, v: {}, id="missing-state"),
+        pytest.param(lambda k, v: {"state": None}, id="none-state"),
+        pytest.param(lambda k, v: {"state": ()}, id="empty-state"),
+        pytest.param(lambda k, v: {"state": 7}, id="scalar-state"),
+        pytest.param(lambda k, v: {"state": (k,)}, id="missing-value"),
+        pytest.param(lambda k, v: {"state": (k, v, v)}, id="extra-element"),
+        pytest.param(lambda k, v: {"state": (None, v)}, id="none-key"),
+        pytest.param(lambda k, v: {"state": (k, None)}, id="none-value"),
+        pytest.param(lambda k, v: {"state": (7, v)}, id="non-tensor-key"),
+        pytest.param(lambda k, v: {"state": (k, 7)}, id="non-tensor-value"),
+        pytest.param(lambda k, v: {"state": (k[0, 0], v)}, id="rank-two-key"),
+        pytest.param(lambda k, v: {"state": (k, v[0])}, id="rank-three-value"),
+        pytest.param(lambda k, v: {"state": (k[None], v)}, id="rank-five-key"),
+        pytest.param(lambda k, v: {"state": (k, v[:, :, :2])}, id="short-value"),
+        pytest.param(
+            lambda k, v: {"state": (k, mx.concatenate([v, v], axis=1))},
+            id="head-count-mismatch",
+        ),
+        pytest.param(
+            lambda k, v: {
+                "state": (mx.concatenate([k, k]), mx.concatenate([v, v]))
+            },
+            id="multi-row",
+        ),
+        pytest.param(
+            lambda k, v: {"state": (k[:, :, :0], v[:, :, :0])},
+            id="empty-prefix",
+        ),
+    ],
+)
+def test_store_refuses_malformed_ring_state_before_allocating_blocks(
+    tmp_path, mock_model, mock_tokenizer, malformed_payload, layer_idx, with_config
+):
+    scheduler = Scheduler(mock_model, mock_tokenizer)
+    payload, config = scheduler._extract_cache_states(
+        [make_filled_cache(), make_filled_cache()]
+    )
+    keys, values = payload[layer_idx].pop("state")
+    payload[layer_idx].update(malformed_payload(keys, values))
+    prefix, paged, ssd = make_ssd_stack(tmp_path, 2, num_layers=2)
+    try:
+        table = prefix.store_cache(
+            "malformed",
+            list(range(12)),
+            payload,
+            model_cache_config=config if with_config else None,
+        )
+        assert table is None
+        assert paged.get_block_table("malformed") is None
+        assert "malformed" not in prefix._request_tables
+        assert all(b.ref_count == 0 for b in paged.blocks if not b.is_null)
+        assert all(b.block_hash is None for b in paged.blocks if not b.is_null)
+    finally:
+        ssd.close()
+
+
+@pytest.mark.parametrize("with_config", [False, True])
+@pytest.mark.parametrize("state_type", [tuple, list])
+def test_store_accepts_ring_kv_with_distinct_feature_dimensions(
+    tmp_path, mock_model, mock_tokenizer, with_config, state_type
+):
+    scheduler = Scheduler(mock_model, mock_tokenizer)
+    payload, config = scheduler._extract_cache_states([make_filled_cache()])
+    keys = mx.arange(8, dtype=mx.float32).reshape(1, 1, 4, 2)
+    values = mx.arange(12, dtype=mx.float32).reshape(1, 1, 4, 3)
+    payload[0]["state"] = state_type((keys, values))
+    prefix, paged, ssd = make_ssd_stack(tmp_path, 2)
+    try:
+        table = prefix.store_cache(
+            "valid",
+            list(range(12)),
+            payload,
+            model_cache_config=config if with_config else None,
+        )
+        assert table is not None and table.num_tokens == 4
+        restored = prefix.reconstruct_cache(table)
+        assert restored is not None and restored[0].offset == 4
+        restored_keys, restored_values = restored[0].state
+        assert mx.array_equal(restored_keys, keys).item()
+        assert mx.array_equal(restored_values, values).item()
+    finally:
+        ssd.close()
+
+
 def test_scheduler_discards_legacy_ocr_prefix(mock_model, mock_tokenizer):
     from unittest.mock import MagicMock
 
@@ -254,7 +343,7 @@ def test_scheduler_discards_legacy_ocr_prefix(mock_model, mock_tokenizer):
     scheduler.paged_cache_manager.delete_block_table.assert_called_once_with("legacy")
 
 
-def make_ssd_stack(directory, block_size):
+def make_ssd_stack(directory, block_size, num_layers=1):
     from omlx.cache.paged_cache import PagedCacheManager
     from omlx.cache.paged_ssd_cache import PagedSSDCacheManager
     from omlx.cache.prefix_cache import BlockAwarePrefixCache
@@ -264,7 +353,7 @@ def make_ssd_stack(directory, block_size):
         max_size_bytes=1024**2,
         hot_cache_max_bytes=0,
         expected_model_name="ocr",
-        expected_num_layers=1,
+        expected_num_layers=num_layers,
         expected_block_size=block_size,
     )
     paged = PagedCacheManager(
@@ -272,7 +361,7 @@ def make_ssd_stack(directory, block_size):
     )
     paged.set_paged_ssd_cache_manager(ssd)
     prefix = BlockAwarePrefixCache(
-        model=SimpleNamespace(layers=[None]),
+        model=SimpleNamespace(layers=[None] * num_layers),
         paged_cache_manager=paged,
         paged_ssd_cache_manager=ssd,
     )

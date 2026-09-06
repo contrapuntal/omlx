@@ -784,13 +784,13 @@ class BlockAwarePrefixCache(CacheManager):
         if not tokens:
             return None
 
-        # Check if cache_data contains extracted tensor states
+        # Recognize extracted payloads even when the first state is missing,
+        # so malformed ring captures cannot bypass validation below.
         is_tensor_data = (
             cache_data
             and isinstance(cache_data, list)
             and len(cache_data) > 0
             and isinstance(cache_data[0], dict)
-            and "state" in cache_data[0]
         )
 
         # Extract cache type information for SSD storage
@@ -831,8 +831,19 @@ class BlockAwarePrefixCache(CacheManager):
                     if idx >= len(cache_data):
                         # Refuse incomplete captures before allocating blocks.
                         return None
-                    keys = cache_data[idx]["state"][0]
-                    if keys is None:
+                    state = cache_data[idx].get("state")
+                    if not isinstance(state, (tuple, list)) or len(state) != 2:
+                        return None
+                    keys, values = state
+                    # Match the reconstruction contract before slicing or
+                    # allocating blocks. K/V feature widths may differ.
+                    if (
+                        getattr(keys, "ndim", None) != 4
+                        or getattr(values, "ndim", None) != 4
+                        or keys.shape[:3] != values.shape[:3]
+                        or keys.shape[0] != 1
+                        or keys.shape[2] <= 0
+                    ):
                         return None
                     tokens = tokens[: keys.shape[2]]
             if not tokens:
