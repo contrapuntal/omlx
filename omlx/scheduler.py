@@ -3287,13 +3287,17 @@ class Scheduler:
         """
         from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
 
+        if CacheTypeRegistry is None:
+            # Without layout classification, do not risk converting a custom
+            # KVCache subclass as ordinary dense KV.
+            return False
         if self._model_uses_mla():
             return False
         if self._model_uses_attention_sinks():
             return False
 
         def _ok(c: Any) -> bool:
-            if type(c).__name__ in ("RingSlidingKVCache", "OMLXRingSlidingKVCache"):
+            if CacheTypeRegistry.is_ring_family(type(c).__name__):
                 return False
             if isinstance(c, KVCache):
                 return True
@@ -3450,7 +3454,18 @@ class Scheduler:
 
     @staticmethod
     def _set_ring_prefill_end(cache: list[Any], remaining_tokens: int) -> None:
-        """Keep size-one prompt chunks out of the native OCR decode ring."""
+        """Declare the absolute end of this request's N-1 prefill.
+
+        remaining_tokens includes the final prompt token reserved for the
+        BatchGenerator kickoff. Both _do_external_prefill and _begin_prefill
+        process tokens[:-1] as prefill and pass tokens[-1:] to insert(); keep
+        this boundary in sync if either split changes. Chunking and VLM
+        embeddings do not change the number of reserved kickoff tokens.
+
+        The final prompt token enters the decode ring, not the permanent
+        prefix. This preserves oMLX's existing split, not native full-prompt
+        parity. Size-one chunks before the boundary must remain prefill.
+        """
         for layer in cache:
             if type(layer).__name__ == "OMLXRingSlidingKVCache":
                 layer.set_prefill_end(layer.offset + max(0, remaining_tokens - 1))
@@ -8044,14 +8059,15 @@ class Scheduler:
                     continue
 
                 if hasattr(layer_cache, "state"):
-                    if handler is not None and class_name in (
-                        "MiniMaxM3KVCache",
-                        "MiniMaxM3BatchKVCache",
-                        "QSAKVCache",
-                        "QSAQuantizedKVCache",
-                        "BatchQSAKVCache",
-                        "RingSlidingKVCache",
-                        "OMLXRingSlidingKVCache",
+                    if handler is not None and (
+                        class_name in (
+                            "MiniMaxM3KVCache",
+                            "MiniMaxM3BatchKVCache",
+                            "QSAKVCache",
+                            "QSAQuantizedKVCache",
+                            "BatchQSAKVCache",
+                        )
+                        or CacheTypeRegistry.is_ring_family(class_name)
                     ):
                         state = handler.serialize_state(layer_cache)
                         meta = handler.serialize_meta_state(layer_cache)
@@ -9821,7 +9837,14 @@ class Scheduler:
         self._generation_overflow_recovery_ids.intersection_update(active_ids)
 
     def _effective_max_num_seqs(self) -> int:
-        """Current admission cap, narrowed for models that require serial decode."""
+        """Current admission cap, narrowed for models that require serial decode.
+
+        _schedule_waiting counts running plus prefilling requests, not just
+        rows in the current decode batch. EngineCore runs this scheduler on
+        its single-worker executor; the cap prevents overlapping admission,
+        while that executor prevents overlapping step() calls. This does not
+        make direct concurrent calls to Scheduler.step() safe.
+        """
         self._refresh_generation_overflow_recovery_ids()
         if (
             self._serialize_llama4_requests

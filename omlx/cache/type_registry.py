@@ -162,6 +162,15 @@ class CacheTypeRegistry:
         return cls._class_name_map.get(class_name) == CacheType.ARRAYS_CACHE
 
     @classmethod
+    def is_ring_family(cls, class_name: str) -> bool:
+        """Match registered ring layouts, not arbitrary KVCache subclasses.
+
+        Family membership permits ring-handler dispatch; it does not imply
+        oMLX's adapted-only set_prefill_end or singleton interfaces.
+        """
+        return cls._class_name_map.get(class_name) == CacheType.RING_SLIDING_KVCACHE
+
+    @classmethod
     def detect_cache_type(cls, cache_obj: Any) -> CacheType:
         """Detect cache type from object.
 

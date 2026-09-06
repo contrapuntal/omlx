@@ -51,6 +51,28 @@ def test_unsafe_multirow_merge_is_rejected():
         _patched_merge_caches([[make_filled_cache()], [make_filled_cache()]])
 
 
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("RingSlidingKVCache", True),
+        ("OMLXRingSlidingKVCache", True),
+        ("KVCache", False),
+        ("RotatingKVCache", False),
+        ("UnregisteredRingSlidingKVCache", False),
+    ],
+)
+def test_ring_family_requires_registered_ring_type(name, expected):
+    assert CacheTypeRegistry.is_ring_family(name) is expected
+
+
+def test_ring_family_does_not_imply_adapted_prefill_interface():
+    native = adapter()._language_model.make_cache()[0]
+    append(native, [0, 1])
+    assert CacheTypeRegistry.is_ring_family(type(native).__name__)
+    Scheduler._set_ring_prefill_end([native], 3)
+    assert native.offset == 2 and native.prefill_length is None
+
+
 def test_ring_prefix_serialization_does_not_export_overwritten_slots():
     cache = make_filled_cache()
     handler = CacheTypeRegistry.get_handler_for_object(cache)
@@ -115,6 +137,18 @@ def test_scheduler_exports_only_intact_prefix(mock_model, mock_tokenizer):
 def test_ring_is_not_turboquant_convertible(mock_model, mock_tokenizer):
     scheduler = Scheduler(mock_model, mock_tokenizer)
     assert not scheduler._turboquant_eligible([make_filled_cache()])
+
+
+def test_turboquant_refuses_cache_when_registry_is_unavailable(
+    monkeypatch, mock_model, mock_tokenizer
+):
+    from mlx_lm.models.cache import KVCache
+
+    import omlx.scheduler as scheduler_module
+
+    scheduler = Scheduler(mock_model, mock_tokenizer)
+    monkeypatch.setattr(scheduler_module, "CacheTypeRegistry", None)
+    assert not scheduler._turboquant_eligible([KVCache()])
 
 
 def test_stale_plain_kv_prefix_is_incompatible():
@@ -316,6 +350,53 @@ def test_store_accepts_ring_kv_with_distinct_feature_dimensions(
         ssd.close()
 
 
+def test_restored_unequal_width_ring_matches_native_decode_after_wrap(
+    tmp_path, mock_model, mock_tokenizer
+):
+    # Native KVCache allocates K and V widths separately. Verify the restored
+    # ring preserves that contract through decode and actual MLX attention.
+    native = adapter()._language_model.make_cache()[0]
+    keys = mx.broadcast_to(mx.arange(4)[None, None, :, None], (1, 1, 4, 192))
+    values = mx.broadcast_to(
+        mx.arange(100, 104)[None, None, :, None], (1, 1, 4, 128)
+    )
+    native.update_and_fetch(keys.astype(mx.float32), values.astype(mx.float32))
+    scheduler = Scheduler(mock_model, mock_tokenizer)
+    payload, config = scheduler._extract_cache_states([native])
+    prefix, paged, ssd = make_ssd_stack(tmp_path, 2)
+    try:
+        table = prefix.store_cache(
+            "unequal-decode", list(range(4)), payload, model_cache_config=config
+        )
+        assert table is not None and table.num_tokens == 4
+        restored_layers = prefix.reconstruct_cache(table)
+        assert restored_layers is not None
+        restored = restored_layers[0]
+        assert restored is not native
+        query = mx.ones((1, 1, 1, 192))
+        for token in range(4, 10):
+            keys = mx.full((1, 1, 1, 192), float(token))
+            values = mx.full((1, 1, 1, 128), float(100 + token))
+            expected_keys, expected_values = native.update_and_fetch(keys, values)
+            actual_keys, actual_values = restored.update_and_fetch(keys, values)
+            assert mx.array_equal(actual_keys, expected_keys).item()
+            assert mx.array_equal(actual_values, expected_values).item()
+            expected = mx.fast.scaled_dot_product_attention(
+                query, expected_keys, expected_values, scale=192**-0.5
+            )
+            actual = mx.fast.scaled_dot_product_attention(
+                query, actual_keys, actual_values, scale=192**-0.5
+            )
+            assert actual.shape == (1, 1, 1, 128)
+            assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5).item()
+        # Four prompt tokens stay permanent; the two-slot ring wrapped twice.
+        assert restored.offset == 10 and restored.prefill_length == 4
+        assert actual_keys[0, 0, :, 0].tolist() == [0, 1, 2, 3, 8, 9]
+        assert actual_values[0, 0, :, 0].tolist() == [100, 101, 102, 103, 108, 109]
+    finally:
+        ssd.close()
+
+
 def test_scheduler_discards_legacy_ocr_prefix(mock_model, mock_tokenizer):
     from unittest.mock import MagicMock
 
@@ -475,7 +556,16 @@ def test_scheduler_prefill_boundary_matches_cold_past_ring_window(
                 # Chunked prefill yields to the scheduler's fairness timer.
                 if not request.is_finished():
                     time.sleep(0.001)
-            assert request.is_finished()
+            state = scheduler._prefill_states.get(request.request_id)
+            assert request.is_finished(), (
+                f"{label}: scheduler did not finish within 10s; "
+                f"status={request.status.name}, "
+                f"generated={len(request.output_token_ids)}/132, "
+                f"cached_tokens={request.cached_tokens}, "
+                f"chunked={use_chunks}, step_size={step}, "
+                f"prefill_processed={state.tokens_processed if state else 'inactive'}, "
+                f"prefill_remaining={state.tokens_remaining.size if state else 'inactive'}"
+            )
             assert len(request.output_token_ids) == 132
             assert request.get_finish_reason() == "length"
             assert all(b.ref_count == 0 for b in paged.blocks if not b.is_null)
@@ -790,5 +880,79 @@ def test_ring_block_tensor_length_must_match_token_count(
         assert prefix.reconstruct_cache(table) is None
         paged.delete_block_table("warm-short")
         assert all(b.ref_count == 0 for b in paged.blocks if not b.is_null)
+    finally:
+        ssd.close()
+
+
+@pytest.mark.parametrize(
+    "corruption, diagnostic",
+    [
+        ("metadata", "Missing Unlimited-OCR metadata for layer 1 in block 1"),
+        ("layer", "Missing Unlimited-OCR layer 1 in block 1"),
+        ("allocation", "is no longer allocated"),
+    ],
+)
+def test_ring_reconstruction_missing_entries_report_context_and_release_refs(
+    tmp_path, mock_model, mock_tokenizer, monkeypatch, caplog, corruption, diagnostic
+):
+    from omlx.request import Request, SamplingParams
+
+    scheduler = Scheduler(mock_model, mock_tokenizer)
+    caches = [make_filled_cache(), make_filled_cache()]
+    payload, config = scheduler._extract_cache_states(caches)
+    prefix, paged, ssd = make_ssd_stack(tmp_path, 2, num_layers=2)
+    try:
+        table = prefix.store_cache(
+            "seed", list(range(4)), payload, model_cache_config=config
+        )
+        assert table is not None and table.num_tokens == 4
+        tail_hash = paged.blocks[table.block_ids[-1]].block_hash
+        paged.delete_block_table("seed")
+        load = ssd.load_block_with_metadata
+
+        def load_incomplete_tail(block_hash, **kwargs):
+            data, metadata = load(block_hash, **kwargs)
+            if block_hash == tail_hash:
+                if corruption == "metadata":
+                    metadata = dict(metadata)
+                    metadata["layer_meta_states"] = metadata["layer_meta_states"][:1]
+                elif corruption == "layer":
+                    data = data[:1]
+                else:
+                    # Simulate a missing allocation on the validation lookup
+                    # only. Keep the real owned blocks available for cleanup.
+                    class MissingValidationLookup(dict):
+                        missing = True
+
+                        def get(self, key, default=None):
+                            block = super().get(key, default)
+                            if (
+                                block is not None
+                                and block.block_hash == tail_hash
+                                and self.missing
+                            ):
+                                self.missing = False
+                                return None
+                            return block
+
+                    monkeypatch.setattr(
+                        paged,
+                        "allocated_blocks",
+                        MissingValidationLookup(paged.allocated_blocks),
+                    )
+            return data, metadata
+
+        monkeypatch.setattr(ssd, "load_block_with_metadata", load_incomplete_tail)
+        scheduler.block_aware_cache = prefix
+        scheduler.paged_cache_manager = paged
+        request = Request("incomplete-tail", list(range(6)), SamplingParams(max_tokens=4))
+        scheduler.add_request(request)
+        scheduler._prepare_prefix_cache_for_request(request)
+        assert request.cached_tokens == 0
+        assert request.prompt_cache is None and request.block_table is None
+        assert request.remaining_tokens == list(range(6))
+        assert paged.get_block_table(request.request_id) is None
+        assert all(b.ref_count == 0 for b in paged.blocks if not b.is_null)
+        assert diagnostic in caplog.text
     finally:
         ssd.close()

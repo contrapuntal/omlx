@@ -176,7 +176,16 @@ class VLMModelAdapter(nn.Module):
 
     @property
     def requires_serial_decode(self) -> bool:
-        """Unlimited-OCR's native ring cache has no safe multi-row conversion."""
+        """Unlimited-OCR's native ring cache has no safe multi-row conversion.
+
+        EngineCore's single-worker executor serializes scheduler execution;
+        the scheduler additionally admits only one running/prefilling request
+        for this model. Fresh/restored caches belong to individual requests,
+        not the shared weights. EngineCore registers model-object ownership;
+        forced transfer resets the previous owner's scheduler but does not
+        stop its engine loop. Other engines with separate models may still
+        run concurrently.
+        """
         return self.model_type == "unlimited-ocr"
 
     def is_prefix_cache_compatible(self, caches: List[Any]) -> bool:
