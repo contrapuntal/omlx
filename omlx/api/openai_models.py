@@ -11,7 +11,7 @@ These models define the request and response schemas for:
 """
 
 import json
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 
@@ -322,6 +322,13 @@ class StreamOptions(BaseModel):
     include_usage: bool = False
 
 
+class ImagesConfig(BaseModel):
+    """Explicit image preprocessing mode (Unlimited-OCR only)."""
+
+    model_config = {"extra": "forbid"}
+    image_mode: Literal["base", "gundam"]
+
+
 class ChatCompletionRequest(BaseModel):
     """Request for chat completion."""
 
@@ -357,6 +364,7 @@ class ChatCompletionRequest(BaseModel):
     chat_template_kwargs: Optional[Dict[str, Any]] = None
     # Top-level alias used by OpenAI-compatible clients.
     enable_thinking: Optional[bool] = None
+    images_config: ImagesConfig | None = None
     # OpenAI-compatible reasoning depth; forwarded to the chat template.
     # Numbers stay numbers: models like Inkling take a numeric effort
     # (0.1-0.99) while Qwen3.8 uses strings ("low".."xhigh") — each chat

@@ -3892,6 +3892,11 @@ async def create_chat_completion(
             )
 
     if is_markitdown_model(request.model):
+        if request.images_config is not None:
+            raise InvalidRequestError(
+                "images_config is supported only for Unlimited-OCR.",
+                field="images_config",
+            )
         return await _create_markitdown_chat_completion(request, http_request)
 
     request = await _preprocess_markitdown_files_for_llm(request)
@@ -3987,6 +3992,22 @@ async def create_chat_completion(
                 engine.tokenizer,
                 native_reasoning_content=native_reasoning,
                 consolidate_system_messages=False,
+            )
+
+        images_config = None
+        if request.images_config is not None:
+            from .utils.ocr_inputs import resolve_ocr_image_kwargs
+
+            images_config = request.images_config.model_dump()
+            num_images = sum(
+                part.get("type") in ("image_url", "image", "input_image")
+                for message in messages
+                if isinstance(message.get("content"), list)
+                for part in message["content"]
+                if isinstance(part, dict)
+            )
+            resolve_ocr_image_kwargs(
+                engine.model_type if is_vlm else None, images_config, num_images
             )
 
         # Detect and strip partial mode at the API boundary — exactly once,
@@ -4138,6 +4159,8 @@ async def create_chat_completion(
             "xtc_probability": xtc_probability,
             "xtc_threshold": xtc_threshold,
         }
+        if images_config is not None:
+            chat_kwargs["images_config"] = images_config
 
         # Widen the repetition-penalty look-back window when the client
         # asks for it (mlx-lm default window is 20 tokens).

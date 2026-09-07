@@ -55,6 +55,10 @@ from ..utils.image import (
     compute_per_image_hashes,
     extract_images_from_messages,
 )
+from ..utils.ocr_inputs import (
+    image_mode_cache_key,
+    resolve_ocr_image_kwargs,
+)
 from .base import (
     BaseEngine,
     GenerationOutput,
@@ -3311,6 +3315,7 @@ class VLMBatchedEngine(BaseEngine):
         chat_template_kwargs: dict[str, Any] | None = None,
         tools: list[dict] | None = None,
         is_partial: bool | None = None,
+        images_config: dict | None = None,
     ) -> Tuple[
         List[int],
         Optional[mx.array],
@@ -3360,6 +3365,7 @@ class VLMBatchedEngine(BaseEngine):
         num_audios = len(audio) if audio else 0
 
         model_type = self.model_type or ""
+        image_kwargs = resolve_ocr_image_kwargs(model_type, images_config, num_images)
         if model_type == COHERE2_MOE_MODEL_TYPE and (
             num_images > 0 or num_audios > 0
         ):
@@ -3509,6 +3515,7 @@ class VLMBatchedEngine(BaseEngine):
             images=images if images else None,
             audio=audio if audio else None,
             prompts=[prompt] if isinstance(prompt, str) else prompt,
+            **image_kwargs,
         )
 
         input_ids = inputs["input_ids"]
@@ -3566,6 +3573,7 @@ class VLMBatchedEngine(BaseEngine):
                                 if isinstance(prefix_prompt, str)
                                 else prefix_prompt
                             ),
+                            **image_kwargs,
                         )
                         prefix_ids = prefix_inputs["input_ids"]
                         boundary_tokens = (
@@ -3575,7 +3583,9 @@ class VLMBatchedEngine(BaseEngine):
                         )
 
                     images_consumed += msg_num_images
-                    cumulative_hash = compute_image_hash(images[:images_consumed])
+                    cumulative_hash = image_mode_cache_key(
+                        compute_image_hash(images[:images_consumed]), image_kwargs
+                    )
                     image_cache_key_ranges.append((boundary_tokens, cumulative_hash))
 
                 image_cache_key_start = image_cache_key_ranges[0][0]
@@ -3613,7 +3623,9 @@ class VLMBatchedEngine(BaseEngine):
             image_hash = None
             image_token_count = None
             if num_images > 0:
-                image_hash = compute_image_hash(images)
+                image_hash = image_mode_cache_key(
+                    compute_image_hash(images), image_kwargs
+                )
                 image_token_count = self._image_token_count(input_ids)
 
             if (
@@ -3621,7 +3633,10 @@ class VLMBatchedEngine(BaseEngine):
                 and self._vision_cache is not None
                 and self._vision_cache_enabled
             ):
-                per_hashes = compute_per_image_hashes(images)
+                per_hashes = [
+                    image_mode_cache_key(h, image_kwargs)
+                    for h in compute_per_image_hashes(images)
+                ]
                 cached_per_image = [
                     self._vision_cache.get(h, self._model_name) for h in per_hashes
                 ]
@@ -4305,7 +4320,10 @@ class VLMBatchedEngine(BaseEngine):
         # strips images first via ``extract_images_from_messages`` (see
         # ``_process_chat_messages``), so mirroring that here keeps
         # preflight and execution on the same template input.
-        text_messages, _, _ = extract_images_from_messages(messages)
+        text_messages, images, _ = extract_images_from_messages(messages)
+        resolve_ocr_image_kwargs(
+            self.model_type, kwargs.get("images_config"), len(images)
+        )
         prompt = self._apply_chat_template(
             text_messages,
             template_tools,
@@ -4543,6 +4561,7 @@ class VLMBatchedEngine(BaseEngine):
 
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         partial = kwargs.pop("is_partial", None)
+        images_config = kwargs.pop("images_config", None)
 
         # Keep VLM-capable models on one prompt-rendering path, even before the
         # first image arrives. Otherwise the conversation switches prompt families
@@ -4563,6 +4582,7 @@ class VLMBatchedEngine(BaseEngine):
             chat_template_kwargs=ct_kwargs,
             tools=template_tools,
             is_partial=partial,
+            images_config=images_config,
         )
 
         if images:
@@ -4590,6 +4610,11 @@ class VLMBatchedEngine(BaseEngine):
         if not self.is_diffusion_model:
             return
         kwargs = kwargs or {}
+        if kwargs.get("images_config") is not None:
+            raise InvalidRequestError(
+                "images_config is not supported for diffusion models.",
+                field="images_config",
+            )
         if tools and not self.supports_tool_calling:
             raise InvalidRequestError(
                 "Tool calling is not supported for this diffusion model "
