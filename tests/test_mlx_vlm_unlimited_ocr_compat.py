@@ -80,3 +80,106 @@ def test_unlimited_ocr_prompt_leaves_other_models_untouched():
     # formatter (newline-suffixed token), not the unlimited-ocr wrapper.
     message = get_message_json("deepseekocr", "hello", num_images=1)
     assert message == {"role": "user", "content": "<image>\nhello"}
+
+
+def test_unlimited_ocr_default_chat_template_omits_trailing_space():
+    from omlx.patches.mlx_vlm_unlimited_ocr_compat import (
+        apply_mlx_vlm_unlimited_ocr_compat_patch,
+    )
+
+    apply_mlx_vlm_unlimited_ocr_compat_patch()
+
+    from mlx_vlm.models.unlimited_ocr.processing_unlimitedocr import (
+        UnlimitedOCRProcessor,
+    )
+    from transformers import PreTrainedTokenizerFast
+
+    tok = PreTrainedTokenizerFast.from_pretrained(
+        "/Volumes/MacExternalStorage/models/ocr/Unlimited-OCR-oQ8"
+    )
+    proc = UnlimitedOCRProcessor(tokenizer=tok)
+
+    messages = [{"role": "user", "content": "<image>document parsing."}]
+    rendered = proc.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    assert rendered == "<image>document parsing."
+    assert not rendered.endswith(" ")
+
+
+def test_unlimited_ocr_chat_template_patch_idempotent():
+    from omlx.patches.mlx_vlm_unlimited_ocr_compat import (
+        _patch_processor_chat_template,
+        apply_mlx_vlm_unlimited_ocr_compat_patch,
+    )
+    from mlx_vlm.models.unlimited_ocr.processing_unlimitedocr import (
+        UnlimitedOCRProcessor,
+    )
+
+    apply_mlx_vlm_unlimited_ocr_compat_patch()
+    first_prop = UnlimitedOCRProcessor.__dict__["default_chat_template"]
+
+    # Repeated calls should be no-ops and preserve the exact same descriptor
+    assert not _patch_processor_chat_template()
+    assert not apply_mlx_vlm_unlimited_ocr_compat_patch()
+    second_prop = UnlimitedOCRProcessor.__dict__["default_chat_template"]
+    assert first_prop is second_prop
+
+
+def test_unlimited_ocr_chat_template_preserves_explicit_overrides():
+    from omlx.patches.mlx_vlm_unlimited_ocr_compat import (
+        apply_mlx_vlm_unlimited_ocr_compat_patch,
+    )
+    from mlx_vlm.models.unlimited_ocr.processing_unlimitedocr import (
+        UnlimitedOCRProcessor,
+    )
+    from transformers import PreTrainedTokenizerFast
+
+    apply_mlx_vlm_unlimited_ocr_compat_patch()
+
+    tok = PreTrainedTokenizerFast.from_pretrained(
+        "/Volumes/MacExternalStorage/models/ocr/Unlimited-OCR-oQ8"
+    )
+    proc = UnlimitedOCRProcessor(tokenizer=tok)
+    messages = [{"role": "user", "content": "<image>document parsing."}]
+
+    # 1. Explicit kwarg override to apply_chat_template
+    custom_kwarg = "{{messages[0]['content']}} EXPLICIT"
+    rendered_kwarg = proc.apply_chat_template(
+        messages, chat_template=custom_kwarg, tokenize=False
+    )
+    assert rendered_kwarg == "<image>document parsing. EXPLICIT"
+
+    # 2. Explicit instance chat_template override
+    proc.chat_template = "INSTANCE {{messages[0]['content']}}"
+    rendered_inst = proc.apply_chat_template(messages, tokenize=False)
+    assert rendered_inst == "INSTANCE <image>document parsing."
+
+
+def test_unlimited_ocr_chat_template_noop_when_upstream_fix_present(monkeypatch):
+    from omlx.patches.mlx_vlm_unlimited_ocr_compat import (
+        _patch_processor_chat_template,
+    )
+    from mlx_vlm.models.unlimited_ocr.processing_unlimitedocr import (
+        UnlimitedOCRProcessor,
+    )
+
+    class UpstreamProp(property):
+        pass
+
+    upstream_descriptor = UpstreamProp(lambda self: "upstream template")
+    # Simulate upstream mlx-vlm having merged PR #2164 (own default_chat_template without _omlx_compat_2164)
+    monkeypatch.setattr(
+        UnlimitedOCRProcessor,
+        "default_chat_template",
+        upstream_descriptor,
+        raising=False,
+    )
+
+    # Patch call should detect upstream fix and do nothing
+    result = _patch_processor_chat_template()
+    assert result is False
+    assert (
+        UnlimitedOCRProcessor.__dict__["default_chat_template"] is upstream_descriptor
+    )
+
