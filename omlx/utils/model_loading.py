@@ -702,6 +702,26 @@ def maybe_apply_pre_load_patches(
                 model_name,
             )
 
+    if for_vlm and model_type == "qwen2_5_vl":
+        from ..patches.mlx_vlm_teleocr_compat import (
+            apply_mlx_vlm_teleocr_compat_patch,
+            is_teleocr_config,
+            reject_unrecognized_geometry,
+        )
+
+        reject_unrecognized_geometry(config)
+        if is_teleocr_config(config):
+            from ..patches.mlx_vlm_teleocr_compat.checkpoint import (
+                validate_teleocr_checkpoint,
+            )
+
+            validate_teleocr_checkpoint(model_name, config)
+            apply_mlx_vlm_teleocr_compat_patch()
+            logger.info(
+                "TeleOCR mlx-vlm compatibility patch applied for %s",
+                model_name,
+            )
+
     if for_vlm and model_type in ("inkling", "inkling_mm_model"):
         from ..patches.mlx_vlm_inkling_compat import (
             apply_mlx_vlm_inkling_compat_patch,

@@ -1037,7 +1037,82 @@ class TestVLMFallback:
     """Tests for VLM-to-LLM fallback during engine loading."""
 
     @pytest.mark.asyncio
-    async def test_vlm_fallback_to_llm_on_start_failure(self, small_mock_model_dir):
+    @pytest.mark.parametrize("signal", ["marker", "auto_map", "nested", "flat"])
+    @pytest.mark.parametrize(
+        "config_failure",
+        [None, "removed", "invalid", "missing_before_load", "invalid_before_load"],
+    )
+    async def test_teleocr_vlm_failure_never_serves_text_only(
+        self, small_mock_model_dir, signal, config_failure, caplog
+    ):
+        config = {
+            "model_type": "qwen2_5_vl",
+            "architectures": ["Qwen2_5_VLForConditionalGeneration"],
+            "vision_config": {"hidden_size": 1280},
+        }
+        geometry = {"hidden_size": 1024, "num_attention_heads": 16, "head_dim": 128}
+        if signal == "marker":
+            config["omlx_adapter"] = "teleocr"
+        elif signal == "auto_map":
+            config["auto_map"] = {
+                "AutoModel": "modeling_naviocr.Qwen2_5_VLForConditionalGeneration"
+            }
+        elif signal == "nested":
+            config["text_config"] = geometry
+        else:
+            config.update(geometry)
+        (small_mock_model_dir / "model-a" / "config.json").write_text(
+            json.dumps(config)
+        )
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        entry = pool.get_entry("model-a")
+        assert entry.engine_type == "vlm"
+        vlm = MagicMock()
+        config_path = small_mock_model_dir / "model-a" / "config.json"
+        if config_failure == "missing_before_load":
+            config_path.unlink()
+        elif config_failure == "invalid_before_load":
+            config_path.write_text("{")
+
+        async def fail_start():
+            if config_failure == "removed":
+                config_path.unlink()
+            elif config_failure == "invalid":
+                config_path.write_text("{")
+            raise ValueError("Unexpected patch embedding shape")
+
+        vlm.start = fail_start
+        vlm.stop = AsyncMock()
+        llm = MagicMock()
+        llm.start = AsyncMock()
+
+        with (
+            patch("omlx.engine_pool.VLMBatchedEngine", return_value=vlm),
+            patch("omlx.engine_pool.BatchedEngine", return_value=llm),
+            caplog.at_level(logging.ERROR),
+            pytest.raises(
+                ModelUnavailableError, match="Unexpected patch embedding shape"
+            ),
+        ):
+            await pool._load_engine("model-a")
+
+        assert entry.engine is None
+        assert entry.engine_type == entry.model_type == "vlm"
+        assert not entry.is_loading
+        assert pool.loaded_model_count == 0
+        assert "text-only fallback" in entry.load_failure_message
+        assert "text-only fallback" in caplog.text
+        vlm.stop.assert_awaited_once()
+        llm.start.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "config_failure", [None, "missing", "invalid", "array", "hub_id"]
+    )
+    async def test_vlm_fallback_to_llm_on_start_failure(
+        self, small_mock_model_dir, config_failure
+    ):
         """Test that VLM loading failure falls back to LLM BatchedEngine."""
         pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
@@ -1046,6 +1121,16 @@ class TestVLMFallback:
         entry = pool.get_entry("model-a")
         entry.model_type = "vlm"
         entry.engine_type = "vlm"
+
+        config_path = small_mock_model_dir / "model-a" / "config.json"
+        if config_failure == "missing":
+            config_path.unlink()
+        elif config_failure == "invalid":
+            config_path.write_text("{")
+        elif config_failure == "array":
+            config_path.write_text("[]")
+        elif config_failure == "hub_id":
+            entry.model_path = "unknown-vendor/unresolved-model"
 
         # VLM engine that fails on start
         mock_vlm_engine = MagicMock()

@@ -2276,6 +2276,10 @@ class VLMBatchedEngine(BaseEngine):
         except ValueError:
             raise
         except Exception as e:
+            from ..patches.mlx_vlm_teleocr_compat import TeleOCRCompatibilityError
+
+            if isinstance(e, TeleOCRCompatibilityError):
+                raise
             logger.debug(f"pre-load patches skipped: {e}")
 
         # Load VLM model on the global MLX executor to avoid blocking the event loop

@@ -3921,6 +3921,30 @@ def _source_has_nextn_tensors(keys, config: dict) -> bool:
     return any(k.startswith(prefixes) for k in keys)
 
 
+def _validate_teleocr_conversion(config: dict, source: Path, *, text_only=False) -> None:
+    """Check TeleOCR export support and file confinement before tensor indexing."""
+    from .patches.mlx_vlm_teleocr_compat import is_teleocr_config
+
+    if is_teleocr_config(config):
+        if text_only:
+            raise ValueError(
+                "TeleOCR requires vision conditioning; text-only conversion is not supported."
+            )
+        from .patches.mlx_vlm_teleocr_compat.checkpoint import (
+            validate_teleocr_checkpoint,
+        )
+
+        validate_teleocr_checkpoint(source, config)
+
+
+def _stamp_adapter_marker(config: dict) -> None:
+    """Keep exported checkpoints self-describing if vendor metadata is removed."""
+    from .patches.mlx_vlm_teleocr_compat import is_teleocr_config
+
+    if is_teleocr_config(config):
+        config["omlx_adapter"] = "teleocr"
+
+
 def _hoist_tie_word_embeddings(config: dict) -> None:
     """Copy a nested ``tie_word_embeddings`` up to the top level (in place).
 
@@ -4106,6 +4130,27 @@ def _build_model_sanitizer(
             logger.debug("Qwen4-Exp quantization patch not applied: %s", patch_err)
 
     if is_vlm:
+        # TeleOCR shares qwen2_5_vl's model_type but changes attention shapes
+        # and Q/K normalization. Standalone conversion must select its adapter
+        # even when no serving model has been loaded in this process.
+        from omlx.patches.mlx_vlm_teleocr_compat import (
+            apply_mlx_vlm_teleocr_compat_patch,
+            is_teleocr_config,
+            reject_unrecognized_geometry,
+        )
+
+        reject_unrecognized_geometry(config)
+        if is_teleocr_config(config):
+            from omlx.patches.mlx_vlm_teleocr_compat.checkpoint import (
+                validate_teleocr_checkpoint,
+            )
+
+            if model_path is None:
+                raise ValueError(
+                    "TeleOCR sanitization requires a checkpoint path for validation"
+                )
+            validate_teleocr_checkpoint(model_path, config)
+            apply_mlx_vlm_teleocr_compat_patch()
         try:
             try:
                 model_type = config.get("model_type")
@@ -4300,6 +4345,14 @@ def _build_model_sanitizer(
             )
             return _vlm_sanitize
         except Exception as e:
+            if is_teleocr_config(config):
+                from omlx.patches.mlx_vlm_teleocr_compat import (
+                    TeleOCRCompatibilityError,
+                )
+
+                raise TeleOCRCompatibilityError(
+                    f"TeleOCR sanitize setup failed: {e}"
+                ) from e
             logger.debug(f"mlx-vlm sanitizer not available: {e}")
 
     try:
@@ -6061,6 +6114,7 @@ def quantize_oq_streaming(
     config_path = source / "config.json"
     with open(config_path) as f:
         config = json.load(f)
+    _validate_teleocr_conversion(config, source, text_only=text_only)
     normalized_model_type = str(config.get("model_type", "")).lower().replace(
         "-", "_"
     )
@@ -6901,6 +6955,7 @@ def quantize_oq_streaming(
     # TextConfig from the root config. Without this the quantized VLM fails to
     # load and degrades to a text-only engine that silently ignores images.
     _hoist_tie_word_embeddings(output_config)
+    _stamp_adapter_marker(output_config)
     quant_info = dict(quantization_config)
     for key, val in per_layer_config.items():
         quant_info[key] = val
@@ -8186,6 +8241,9 @@ def _collect_imatrix_from_model(
     progress_end: float = 18.0,
     model_bytes: int = 0,
 ) -> tuple[dict[str, OQImatrixEntry], dict[str, Any]]:
+    from .patches.mlx_vlm_teleocr_compat import is_teleocr_config
+
+    teleocr = is_teleocr_config(config)
     adaptive_max_samples = max(
         int(num_samples),
         min(
@@ -8348,6 +8406,13 @@ def _collect_imatrix_from_model(
 
                 _collect_glm5_next_lm_head_imatrix(model, inputs, collector)
                 _collect_k2_horizon_lm_head_imatrix(model, inputs, collector)
+                if teleocr:
+                    _collect_untied_lm_head_imatrix(
+                        model.language_model.model,
+                        inputs,
+                        collector,
+                        "language_model.lm_head",
+                    )
 
                 # Match the head's decode-time hidden-state normalization.
                 if _collect_mtp_head_imatrix(
@@ -10054,6 +10119,7 @@ def _build_streaming_proxy_for_sensitivity(
 
     with open(source / "config.json") as f:
         config = json.load(f)
+    _validate_teleocr_conversion(config, source)
     _validate_oq_dtype_for_model(config, dtype)
     target_dtype = mx.bfloat16 if dtype == "bfloat16" else mx.float16
 
@@ -10249,6 +10315,7 @@ def _build_streaming_proxy_for_sensitivity(
     # TextConfig from the root config. Without this the quantized VLM fails to
     # load and degrades to a text-only engine that silently ignores images.
     _hoist_tie_word_embeddings(output_config)
+    _stamp_adapter_marker(output_config)
     quant_info = dict(quantization_config)
     for key, val in per_layer_config.items():
         quant_info[key] = val

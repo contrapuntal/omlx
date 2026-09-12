@@ -317,6 +317,8 @@ class EngineEntry:
     # engine falls back, so identical requests keep reusing that fallback.
     runtime_settings_signature: tuple[tuple[str, str], ...] | None = None
     load_failed: bool = False  # Sticky until the next discovery refresh
+    # Positive evidence retained if config.json disappears after discovery.
+    vlm_fallback_refusal_reason: str | None = None
     load_failure_message: str | None = None
     load_failure_at: float | None = None
     # Owner tokens that have claimed this model. When the set empties (via
@@ -1309,6 +1311,7 @@ class EnginePool:
         from pathlib import Path
 
         from .model_discovery import discover_models_from_dirs
+        from .patches.mlx_vlm_teleocr_compat import vlm_fallback_refusal_reason
 
         if isinstance(model_dirs, str):
             dirs = [Path(model_dirs)]
@@ -1351,6 +1354,11 @@ class EnginePool:
                     source_repo_id=getattr(info, "source_repo_id", None),
                     is_helper=getattr(info, "is_helper", False),
                     is_pinned=model_id in pinned_set,
+                    vlm_fallback_refusal_reason=(
+                        vlm_fallback_refusal_reason(info.model_path)
+                        if info.engine_type == "vlm"
+                        else None
+                    ),
                 )
 
             if model_id in pinned_set:
@@ -3463,6 +3471,16 @@ class EnginePool:
         pre_load_memory = max(mx.get_active_memory(), get_phys_footprint())
         try:
             effective_type = entry.engine_type
+            fallback_refusal_reason = None
+            if effective_type == "vlm":
+                from .patches.mlx_vlm_teleocr_compat import (
+                    vlm_fallback_refusal_reason,
+                )
+
+                fallback_refusal_reason = vlm_fallback_refusal_reason(
+                    entry.model_path, entry.vlm_fallback_refusal_reason
+                )
+                entry.vlm_fallback_refusal_reason = fallback_refusal_reason
             if force_lm and effective_type == "vlm":
                 effective_type = "batched"
                 logger.info(f"Loading model as LM (force_lm=True): {model_id}")
@@ -3793,13 +3811,28 @@ class EnginePool:
                         await engine.stop()
                     except Exception:
                         pass
+
                     gc.collect()
                     loop = asyncio.get_running_loop()
                     await loop.run_in_executor(
                         get_mlx_executor(),
                         lambda: (mx.synchronize(), mx.clear_cache()),
                     )
+                    # Use the pre-load decision even if config.json disappears
+                    # or becomes unreadable while the engine is starting.
+                    if fallback_refusal_reason is not None:
+                        message = (
+                            f"VLM load failed for {model_id}; refusing text-only fallback "
+                            f"({fallback_refusal_reason}): {start_error}"
+                        )
+                        logger.error(message)
+                        raise RuntimeError(message) from start_error
 
+                    # Other VLMs retain the existing LLM fallback.
+                    logger.warning(
+                        f"VLM loading failed for {model_id}, "
+                        f"falling back to LLM: {start_error}"
+                    )
                     engine = BatchedEngine(
                         model_name=entry.model_path,
                         trust_remote_code=trc,
