@@ -2260,6 +2260,8 @@ class TestEmbeddingEngineOrdering:
         cfg = SimpleNamespace(
             embedding_batch_size=batch_size,
             embedding_max_mask_elements=max_mask_elements,
+            # ForwardFairnessGate reads decode_fairness off a provided config.
+            decode_fairness=True,
         )
         return EmbeddingEngine("test-model", scheduler_config=cfg)
 
@@ -2333,7 +2335,12 @@ class TestEmbeddingEngineReviewFixes:
         from omlx.engine.embedding import EmbeddingEngine
         from omlx.models.embedding import EmbeddingOutput
 
-        cfg = SimpleNamespace(embedding_batch_size=8, embedding_max_mask_elements=10**12)
+        cfg = SimpleNamespace(
+            embedding_batch_size=8,
+            embedding_max_mask_elements=10**12,
+            # ForwardFairnessGate reads decode_fairness off a provided config.
+            decode_fairness=True,
+        )
         engine = EmbeddingEngine("test-model", scheduler_config=cfg)
         with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel:
             model = MagicMock()
