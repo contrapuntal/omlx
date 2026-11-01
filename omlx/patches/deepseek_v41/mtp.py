@@ -34,17 +34,30 @@ class AcceptanceDepthController:
 class DSparkMixin:
     _omlx_mtp_multi_request = True
 
-    def _omlx_prefill(self, input_ids, cache=None, **kwargs):
+    def _omlx_prefill(self, input_ids, cache=None, next_prefill_tokens=0, **kwargs):
         """Scheduler cache-only entry; normal forward retains full logits."""
-        return self(input_ids, cache=cache, _ced_prefill=True, **kwargs)
+        return self(
+            input_ids,
+            cache=cache,
+            _ced_prefill=True,
+            next_prefill_tokens=next_prefill_tokens,
+            **kwargs,
+        )
 
     @property
     def args(self):
         return self._config
 
-    def configure_mtp(self, enabled, depth=5):
-        if enabled and not self._config.preserve_mtp:
+    def configure_mtp(self, enabled, depth=5, *, verify_only=False):
+        """Arm DSpark decoding.
+
+        ``verify_only`` is a cluster rank without the draft head: it runs the
+        verify forwards and rollbacks rank zero chose, but never captures
+        target taps or drafts.
+        """
+        if enabled and not verify_only and not self._config.preserve_mtp:
             raise ValueError("DSpark decoding requires preserved MTP weights")
+        self._omlx_mtp_verify_only = bool(enabled and verify_only)
         self._omlx_mtp_decode_enabled = bool(enabled)
         self._omlx_dspark_decode_enabled = bool(enabled)
         self._omlx_mtp_chain = True
@@ -52,6 +65,12 @@ class DSparkMixin:
         self._omlx_mtp_rowwise_unsupported = True
         self._omlx_mtp_independent_verify = True
         self._omlx_mtp_depth = max(1, min(depth, self._config.dspark_block_size))
+        # One-token decode then runs the kernels of verify blocks (decode_fused), so a
+        # verified draft gets the logits that decoding it alone gives.
+        for layer in getattr(self, "layers", ()):
+            # A pipeline stage holds None in place of other ranks' layers.
+            if layer is not None:
+                object.__setattr__(layer, "_omlx_verify_exact", bool(enabled))
 
     def make_mtp_depth_controller(self, depth):
         return AcceptanceDepthController(depth)
@@ -145,9 +164,11 @@ class DSparkMixin:
         target_verify = kwargs.pop("target_verify", False)
         n_confirmed = kwargs.pop("n_confirmed", 0)
         verify = bool(target_verify or n_confirmed)
-        active = getattr(self, "_omlx_dspark_decode_enabled", False)
+        verify_only = getattr(self, "_omlx_mtp_verify_only", False)
+        active = getattr(self, "_omlx_dspark_decode_enabled", False) and not verify_only
         capture_dspark = kwargs.pop("return_dspark_hidden", False)
-        capture = return_hidden or bool(capture_dspark)
+        # A verify-only rank may not hold the target layers the taps come from.
+        capture = (return_hidden or bool(capture_dspark)) and not verify_only
         if kwargs.get("_ced_prefill", False) and self._config.ced_prefill:
             if input_ids.shape[0] != 1:
                 raise ValueError("CED scheduler prefill requires one request row")
@@ -168,6 +189,7 @@ class DSparkMixin:
             token_types=token_types,
             return_dspark_hidden=capture or prime,
             mtp_verify_states=verify_states,
+            _dspark_prime=prime,
             **kwargs,
         )
         if verify:
@@ -176,6 +198,12 @@ class DSparkMixin:
             logits, hidden = result
             # The draft ring retains one window; reset across omitted spans
             # using the existing absolute-position prompt-capture contract.
-            capture_prompt(self, input_ids[:, -hidden.shape[1] :], hidden, cache)
+            # A chunk that skipped its decoder layers returns no hidden. The
+            # rows may start before input_ids when a skipped window was replayed;
+            # the capture only reads their count.
+            if hidden is not None:
+                capture_prompt(self, hidden[..., 0], hidden, cache)
             return logits
+        if verify_only and return_hidden:
+            return result, None
         return result

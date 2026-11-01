@@ -30,6 +30,7 @@ import functools
 import hashlib
 import importlib
 import inspect
+import itertools
 import json
 import logging
 import threading
@@ -45,13 +46,16 @@ from ..api.utils import (
     detect_and_strip_partial,
     remove_special_tokens_preserve_whitespace,
 )
+from ..cache.paged_ssd_cache import numerics_revision_for_model
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
 from ..model_settings import ane_prefill_backend, ane_prefill_fraction
 from ..models.vlm import VLMModelAdapter
+from ..patches import qwen35_packed_linear
 from ..patches.gemma4_audio import apply_gemma4_audio_patch
 from ..patches.mlx_lm_mtp import drafter_target
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
+from ..patches.muse_spark import model as muse_spark_model
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..speculative.dflash import attach_drafter, detach_drafter
 from ..utils.image import (
@@ -81,8 +85,41 @@ from .base import (
     _run_scheduler_preflight_with_cleanup_retry,
     _warn_scheduler_unreachable_once,
 )
+from .lfm3_realtime import LFM3VoiceBackend
+from .lfm3_speech import SPEECH_MODEL_TYPES, LFM3Speech
+from .qwen3_omni_realtime import Qwen3OmniVoiceBackend
+from .realtime_voice import RealtimeVoiceError, RealtimeVoiceSession
 
 logger = logging.getLogger(__name__)
+
+_VOICE_BACKENDS = {
+    "lfm3_audio": LFM3VoiceBackend,
+    "lfm3_omni": LFM3VoiceBackend,
+    "qwen3_omni_moe": Qwen3OmniVoiceBackend,
+}
+
+
+def realtime_voice_names(config: dict) -> list[str]:
+    """Voices a /v1/realtime session on this checkpoint can pick."""
+    backend_class = _VOICE_BACKENDS.get(config.get("model_type"))
+    return backend_class.voice_names(config) if backend_class else []
+
+
+def realtime_voice_instructions(config: dict) -> str:
+    """System prompt a /v1/realtime session on this checkpoint starts with."""
+    backend_class = _VOICE_BACKENDS.get(config.get("model_type"))
+    return backend_class.default_instructions if backend_class else ""
+
+
+def realtime_voice_capabilities(config: dict) -> dict:
+    """Whether a /v1/realtime session on this checkpoint reads images and calls tools."""
+    backend_class = _VOICE_BACKENDS.get(config.get("model_type"))
+    if backend_class is None:
+        return {"input_image": False, "tools": False}
+    return {
+        "input_image": backend_class.accepts_images(config),
+        "tools": backend_class.supports_tools,
+    }
 
 # OCR model types that require special handling.
 # unlimited-ocr keeps its dashed config model_type (mlx-vlm resolves it to the
@@ -108,6 +145,8 @@ OCR_MODEL_PROMPTS: Dict[str, str] = {
     "dots_ocr": "Convert this page to clean Markdown while preserving reading order.",
     "glm_ocr": "Text Recognition:",
 }
+# Unlimited-OCR-2 (DASH decoder) defaults to this prompt for any page count.
+UNLIMITED_OCR_2_PROMPT = "Multi page parsing."
 
 # Extra stop sequences for OCR models to prevent degeneration.
 # Many OCR models lack proper EOS handling and generate chat-turn
@@ -226,6 +265,10 @@ def _apply_minimax_m3_thinking_mode(
         template_kwargs["thinking_mode"] = "enabled"
     elif enable_thinking is False:
         template_kwargs["thinking_mode"] = "disabled"
+    elif str(template_kwargs.get("reasoning_effort", "")).strip().lower() == "none":
+        # MiniMax renders the effort level verbatim; "none" also turns
+        # thinking off, as the reference server does.
+        template_kwargs["thinking_mode"] = "disabled"
 
 
 def _attach_vlm_tokenizer_runtime(tokenizer: Any, model_path: Path, eos_token_id: Any):
@@ -304,17 +347,24 @@ def _patch_video_processor_bug():
        ProcessorMixin which passes ``video_processor`` as a kwarg. HF's
        own ProcessorMixin.__init__ rejects unexpected kwargs, so it is
        patched to silently drop ``video_processor``.
+
+    mlx-vlm's Qwen3-Omni processor needs its video processor: the modality
+    entry is restored while that processor initializes, because
+    ProcessorMixin derives its attribute list from the mapping. Other
+    processors still drop it.
     """
     global _video_processor_patched
     if _video_processor_patched:
         return
 
+    mapping = None
+    video_entry = None
     try:
         from transformers.processing_utils import MODALITY_TO_AUTOPROCESSOR_MAPPING
 
         mapping = MODALITY_TO_AUTOPROCESSOR_MAPPING._MAPPING_NAMES
-        if "video_processor" in mapping:
-            del mapping["video_processor"]
+        video_entry = mapping.pop("video_processor", None)
+        if video_entry is not None:
             logger.debug(
                 "Removed video_processor from MODALITY_TO_AUTOPROCESSOR_MAPPING"
             )
@@ -327,6 +377,18 @@ def _patch_video_processor_bug():
         _orig_pm_init = ProcessorMixin.__init__
 
         def _pm_init_drop_video(self, *args, **kwargs):
+            params = list(inspect.signature(type(self).__init__).parameters)[1:]
+            video = kwargs.get("video_processor")
+            if video is None and "video_processor" in params:
+                index = params.index("video_processor")
+                video = args[index] if index < len(args) else None
+            keeps_video = type(self).__name__ == "Qwen3OmniMoeProcessor"
+            if keeps_video and video is not None and video_entry is not None:
+                mapping["video_processor"] = video_entry
+                try:
+                    return _orig_pm_init(self, *args, **kwargs)
+                finally:
+                    mapping.pop("video_processor", None)
             kwargs.pop("video_processor", None)
             return _orig_pm_init(self, *args, **kwargs)
 
@@ -1032,17 +1094,29 @@ def _strip_vision_config_if_orphaned(model_dir: Path):
         _nn.Module.load_weights = original_load_weights
 
 
+def _index_declares_sidecar_shard(model_dir: Path, sidecar: Path) -> bool:
+    """True when ``model.safetensors.index.json`` lists the resolved sidecar."""
+    index = model_dir / "model.safetensors.index.json"
+    try:
+        shards = set(json.loads(index.read_text())["weight_map"].values())
+    except Exception:
+        return False
+    return sidecar.relative_to(model_dir.resolve()).as_posix() in shards
+
+
 @contextlib.contextmanager
 def _load_optiq_vision_sidecar_on_load(model_dir: Path):
     """Include a config-declared OptiQ sidecar in mlx-vlm strict loading.
 
-    Pinned mlx-vlm only globs ``*.safetensors`` in the model root, while
-    current OptiQ VLM checkpoints keep their unquantized multimodal weights
-    under ``optiq/``. Root-level legacy sidecars remain a no-op because the
-    native glob already loads them.
+    mlx-vlm loads index-listed shards, or globs the model root without an index.
+    Inject only a subdirectory sidecar that the index does not list.
     """
     sidecar = _resolve_optiq_vision_sidecar(model_dir)
-    if sidecar is None or sidecar.parent == model_dir.resolve():
+    if (
+        sidecar is None
+        or sidecar.parent == model_dir.resolve()
+        or _index_declares_sidecar_shard(model_dir, sidecar)
+    ):
         yield
         return
 
@@ -1174,6 +1248,26 @@ def _gemma4_global_kv_from_per_layer_config(config: dict) -> dict[str, int]:
         if len(values) == 1:
             derived[legacy_key] = values.pop()
     return derived
+
+
+@contextlib.contextmanager
+def _preserve_gemma4_unified_image_processor_on_load(model_dir: Path):
+    """Keep the gemma4_unified image processor built from processor_config.json.
+
+    mlx-vlm's load() replaces it with a default one, dropping max_soft_tokens.
+    """
+    if _read_config_model_type(str(model_dir)) != "gemma4_unified":
+        yield
+        return
+
+    import mlx_vlm.utils as _vu
+
+    original = _vu.load_image_processor
+    _vu.load_image_processor = lambda *args, **kwargs: None
+    try:
+        yield
+    finally:
+        _vu.load_image_processor = original
 
 
 @contextlib.contextmanager
@@ -2073,6 +2167,10 @@ class VLMBatchedEngine(BaseEngine):
         self._diffusion_lock = asyncio.Lock()
         self._diffusion_active_requests = 0
         self._diffusion_cancel_events: set[threading.Event] = set()
+        # LFM3 speech requests run outside the scheduler's output collectors.
+        self._speech_active = 0
+        self._realtime_session: RealtimeVoiceSession | None = None
+        self._realtime_opening = False
 
     async def _preflight_or_raise_with_eviction(
         self,
@@ -2102,6 +2200,10 @@ class VLMBatchedEngine(BaseEngine):
         return self._tokenizer
 
     @property
+    def supports_logprobs(self) -> bool:
+        return not self.is_diffusion_model
+
+    @property
     def supports_early_tool_call_streaming(self) -> bool:
         """Opt in only when the local scheduler has no structured parser."""
 
@@ -2124,6 +2226,47 @@ class VLMBatchedEngine(BaseEngine):
             if hasattr(config, "model_type"):
                 return config.model_type
         return None
+
+    @property
+    def supports_realtime_voice(self) -> bool:
+        backend_class = _VOICE_BACKENDS.get(self.model_type)
+        return backend_class is not None and backend_class.supports(self._vlm_model)
+
+    async def create_realtime_session(self) -> RealtimeVoiceSession:
+        """Open the engine's one spoken conversation for /v1/realtime."""
+        backend_class = _VOICE_BACKENDS.get(self.model_type)
+        if not self.supports_realtime_voice or self._engine is None:
+            raise RealtimeVoiceError(
+                "unsupported_model", f"{self._model_name} has no realtime voice backend"
+            )
+        if self._realtime_session is not None or self._realtime_opening:
+            raise RealtimeVoiceError(
+                "session_limit", f"{self._model_name} already has a voice session"
+            )
+        self._realtime_opening = True
+        try:
+            loop = asyncio.get_running_loop()
+            backend = await loop.run_in_executor(
+                self._engine._mlx_executor,
+                backend_class,
+                self._vlm_model,
+                self._processor,
+            )
+            self._realtime_session = RealtimeVoiceSession(self, backend)
+        finally:
+            self._realtime_opening = False
+        return self._realtime_session
+
+    def release_realtime_session(self, session: RealtimeVoiceSession) -> None:
+        if self._realtime_session is session:
+            self._realtime_session = None
+
+    @property
+    def speech(self) -> LFM3Speech | None:
+        """ASR, TTS and spoken replies of a loaded LFM3-Audio or LFM3-Omni model."""
+        if self.model_type not in SPEECH_MODEL_TYPES:
+            return None
+        return LFM3Speech(self)
 
     @property
     def message_extractor(self):
@@ -2296,6 +2439,9 @@ class VLMBatchedEngine(BaseEngine):
                 _strip_vision_config_if_orphaned(Path(self._model_name)),
                 _drop_gemma4_mlx_shared_kv_extras_on_load(Path(self._model_name)),
                 _derive_gemma4_global_kv_on_load(Path(self._model_name)),
+                _preserve_gemma4_unified_image_processor_on_load(
+                    Path(self._model_name)
+                ),
                 _force_minimax_m3_moe_sanitize_on_load(Path(self._model_name)),
                 _force_qwen4_exp_sanitize_on_load(Path(self._model_name)),
                 _remap_nested_visual_on_load(Path(self._model_name)),
@@ -2355,6 +2501,19 @@ class VLMBatchedEngine(BaseEngine):
                                 False,
                             )
                         ),
+                        a8_prefill=bool(
+                            getattr(self._model_settings, "a8_prefill_enabled", False)
+                        ),
+                        a8_prefill_min_tokens=int(
+                            getattr(self._model_settings, "a8_prefill_min_tokens", 128)
+                        ),
+                    )
+                if model_type == "muse_spark":
+                    return muse_spark_model.load(
+                        self._model_name,
+                        lazy=getattr(
+                            self._model_settings, "moe_expert_offload_enabled", False
+                        ),
                     )
                 if model_type == COHERE2_MOE_MODEL_TYPE:
                     return _load_cohere2_moe_text_model(
@@ -2392,7 +2551,7 @@ class VLMBatchedEngine(BaseEngine):
 
         restored = restore_bonsai_quantized_modules(self._vlm_model)
         if restored:
-            logger.info("Restored oMLX Bonsai kernel paths for %d modules", restored)
+            logger.info("Rebound %d mlx-vlm 1-bit modules to stock MLX", restored)
 
         if self.model_type in NATIVE_VIDEO_MODEL_TYPES:
             self._native_video = attach_native_video_processor(
@@ -2482,10 +2641,20 @@ class VLMBatchedEngine(BaseEngine):
 
         # Materialize lazy buffers (RoPE freqs, vision/audio towers) on the
         # loader thread so per-engine inference threads can read them (#1304).
-        from ..utils.model_loading import materialize_lazy_state
+        from ..utils.model_loading import (
+            apply_activation_fp16,
+            materialize_lazy_state,
+        )
 
         await loop.run_in_executor(
             get_mlx_executor(), materialize_lazy_state, self._vlm_model
+        )
+
+        await loop.run_in_executor(
+            get_mlx_executor(),
+            apply_activation_fp16,
+            self._vlm_model,
+            self._model_settings,
         )
 
         # t5 ternary: free unused bias tensors to recover ~420 MB RAM.
@@ -2649,6 +2818,9 @@ class VLMBatchedEngine(BaseEngine):
                             True,
                         ),
                         install_dispatch=False,
+                        packed_projections=qwen35_packed_linear.enabled(
+                            self._vlm_model
+                        ),
                     )
 
                 ane_count = await loop.run_in_executor(
@@ -2662,8 +2834,6 @@ class VLMBatchedEngine(BaseEngine):
         # the M5 tensor units. Replaces the layers in place, so resident
         # memory does not grow; runs on the MLX executor before any forward.
         try:
-            from ..patches import qwen35_packed_linear
-
             if qwen35_packed_linear.enabled(self._vlm_model):
                 packed = await loop.run_in_executor(
                     get_mlx_executor(),
@@ -2697,6 +2867,7 @@ class VLMBatchedEngine(BaseEngine):
                 # Agent sessions resend 20-90 screenshots; bound by bytes.
                 max_memory_entries=4096,
                 max_memory_bytes=1024**3,
+                numerics=numerics_revision_for_model(self._vlm_model),
             )
             logger.info(
                 "Vision feature cache enabled (SSD: %s)",
@@ -2742,16 +2913,6 @@ class VLMBatchedEngine(BaseEngine):
             else SchedulerConfig()
         )
         scheduler_config.moe_offload_active = bool(moe_offload_wrapped)
-        if (
-            self._adapter.model_type == "deepseek_v41"
-            and self._adapter.config.ced_prefill
-            and scheduler_config.paged_ssd_cache_dir
-        ):
-            # Approximate decoder states must not become hits in full-prefill
-            # mode (or vice versa) after reloading the model with new settings.
-            scheduler_config.paged_ssd_cache_dir = str(
-                Path(scheduler_config.paged_ssd_cache_dir) / "deepseek_v41_ced_v1"
-            )
 
         engine_config = EngineConfig(
             model_name=self._model_name,
@@ -2791,11 +2952,18 @@ class VLMBatchedEngine(BaseEngine):
                 apply_turboquant_attention_patch()
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 scheduler._turboquant_kv_bits = tq_bits
+                scheduler._turboquant_kv_scheme = getattr(
+                    self._model_settings, "turboquant_kv_scheme", "turboquant"
+                )
                 scheduler._turboquant_skip_last = getattr(
                     self._model_settings, "turboquant_skip_last", True
                 )
                 scheduler._set_model_info_for_monitor()
-                logger.info(f"TurboQuant KV cache enabled for VLM: {tq_bits} bits")
+                logger.info(
+                    "KV cache compression enabled for VLM: %s, %s bits",
+                    scheduler._turboquant_kv_scheme,
+                    tq_bits,
+                )
 
         # head_dim=256 long-context prefill -> O(L) tiled SDPA kernel. See
         # batched.py for rationale. Passthrough-safe; strictly gated route.
@@ -2895,6 +3063,16 @@ class VLMBatchedEngine(BaseEngine):
             except Exception:
                 logger.debug("Qwen q4 MLP prefill patch not applied", exc_info=True)
 
+        # Flint MoE decode: sigmoid top-k routing and the weighted combine
+        # (plus shared expert and residual) in one launch each per layer.
+        if self.model_type == "flint":
+            try:
+                from ..patches.flint_decode import apply_flint_decode_patch
+
+                apply_flint_decode_patch()
+            except Exception:
+                logger.debug("Flint decode patch not applied", exc_info=True)
+
         # Qwen MoE decode router: fuse the top-k select + renormalize chain
         # into one launch for short rows (decode + MTP verify widths).
         try:
@@ -2920,7 +3098,11 @@ class VLMBatchedEngine(BaseEngine):
         # oQ mixed-bit QxA8 prefill kernels. Gated on the per-model setting
         # because it quantizes activations to INT8, which changes numerics;
         # the patch itself falls through for anything it cannot route.
-        if getattr(self._model_settings, "qwen35_oq_a8_enabled", False):
+        # DeepSeek V4.1 applies the setting in its own loader.
+        if (
+            getattr(self._model_settings, "a8_prefill_enabled", False)
+            and self.model_type != "deepseek_v41"
+        ):
             try:
                 from ..patches.qwen35_oq_a8 import apply_qwen35_oq_a8_patch
 
@@ -2930,7 +3112,7 @@ class VLMBatchedEngine(BaseEngine):
                 apply_qwen35_oq_a8_patch(
                     self._vlm_model,
                     min_tokens=int(
-                        getattr(self._model_settings, "qwen35_oq_a8_min_tokens", 128)
+                        getattr(self._model_settings, "a8_prefill_min_tokens", 128)
                     ),
                 )
             except Exception:
@@ -2949,8 +3131,8 @@ class VLMBatchedEngine(BaseEngine):
                         scheduler,
                         requested_ane_sequence_length,
                     )
-                    # Price the compiled I/O surfaces off the full model so
-                    # admission charges them while the banks are resident.
+                    # Price the compiled program weights off the full model
+                    # so admission charges them while the banks are resident.
                     monitor = getattr(scheduler, "memory_monitor", None)
                     if monitor is not None:
                         monitor.set_ane_prefill_transient_bytes(
@@ -3055,7 +3237,14 @@ class VLMBatchedEngine(BaseEngine):
                         get_mlx_executor(), _load_draft
                     )
                     self._engine.engine.scheduler.set_specprefill_draft_model(
-                        draft_model, draft_model_name=specprefill_draft
+                        draft_model,
+                        draft_model_name=specprefill_draft,
+                        keep_pct=getattr(
+                            self._model_settings, "specprefill_keep_pct", None
+                        ),
+                        threshold=getattr(
+                            self._model_settings, "specprefill_threshold", None
+                        ),
                     )
                     logger.info(
                         f"SpecPrefill: draft model loaded ({specprefill_draft})"
@@ -3182,6 +3371,8 @@ class VLMBatchedEngine(BaseEngine):
                     logger.warning(f"Error closing engine: {e}")
         self._diffusion_cancel_events = set()
         self._diffusion_active_requests = 0
+        self._speech_active = 0
+        self._realtime_session = None
         logger.info("VLMBatchedEngine stopped")
         if cancelled:
             raise asyncio.CancelledError
@@ -3203,6 +3394,7 @@ class VLMBatchedEngine(BaseEngine):
         # and examples, so upstream inference incorrectly selects json_tools.
         # Use the same oMLX protocol adapter as distributed ranks.
         from ..adapter.output_parser import (
+            correct_tool_parser_type,
             install_minimax_m3_tokenizer_protocol,
         )
 
@@ -3221,7 +3413,9 @@ class VLMBatchedEngine(BaseEngine):
                 load_tool_module,
             )
 
-            tool_parser_type = _infer_tool_parser(chat_template)
+            tool_parser_type = correct_tool_parser_type(
+                _infer_tool_parser(chat_template), chat_template
+            )
             if tool_parser_type is None:
                 return
             try:
@@ -3232,8 +3426,6 @@ class VLMBatchedEngine(BaseEngine):
         except ImportError:
             # Fallback: mlx_lm only (no Gemma4 support)
             try:
-                import importlib
-
                 from mlx_lm.tokenizer_utils import (
                     _infer_tool_parser as _mlx_lm_infer,
                 )
@@ -3588,9 +3780,48 @@ class VLMBatchedEngine(BaseEngine):
                         video_content.append({"type": "text", "text": item_text})
                 formatted_messages.append({"role": role, "content": video_content})
             else:
+                prompt: Any = content
+                parts: list[dict] = []
+                if isinstance(raw_content, list):
+                    parts = [
+                        (
+                            item
+                            if isinstance(item, dict)
+                            else {
+                                "type": getattr(item, "type", ""),
+                                "text": getattr(item, "text", ""),
+                            }
+                        )
+                        for item in raw_content
+                    ]
+                image_pos = [
+                    i for i, p in enumerate(parts) if p.get("type") in image_part_types
+                ][:msg_num_images]
+                # Text between images labels them, and flattening moves every
+                # image ahead of all text. Audio turns keep the flat layout
+                # because mlx-vlm keeps audio markers in the prefix.
+                if (
+                    msg_num_images > 1
+                    and msg_num_audios == 0
+                    and len(image_pos) == msg_num_images
+                    and extract_text_from_content(
+                        parts[image_pos[0] + 1 : image_pos[-1]]
+                    )
+                ):
+                    prompt = []
+                    for is_image, group in itertools.groupby(
+                        enumerate(parts),
+                        key=lambda ip: ip[1].get("type") in image_part_types,
+                    ):
+                        if is_image:
+                            prompt.extend(
+                                {"type": "image"} for i, _ in group if i in image_pos
+                            )
+                        elif text := extract_text_from_content([p for _, p in group]):
+                            prompt.append({"type": "text", "text": text})
                 formatted = get_message_json(
                     model_type,
-                    content,
+                    prompt,
                     role,
                     skip_image_token=role != "user" or msg_num_images == 0,
                     skip_audio_token=role != "user" or msg_num_audios == 0,
@@ -4259,6 +4490,12 @@ class VLMBatchedEngine(BaseEngine):
 
         model_type = self.model_type or _read_config_model_type(self._model_name) or ""
         image_kwargs = resolve_ocr_image_kwargs(model_type, images_config, num_images)
+        if model_type == "flint" and (num_images or num_audios or num_videos):
+            raise InvalidRequestError(
+                "Flint is a text-only model and does not support "
+                "image, audio, or video input.",
+                field="messages",
+            )
         if model_type == COHERE2_MOE_MODEL_TYPE and (
             num_images > 0 or num_audios > 0
         ):
@@ -4441,6 +4678,10 @@ class VLMBatchedEngine(BaseEngine):
                     "model repository.",
                     field="messages",
                 )
+            # The Unlimited-OCR processor reads a prompt list as a batch with
+            # one image per prompt. A single prompt string keeps every page.
+            if model_type == "unlimited-ocr" and isinstance(prompt, str):
+                prompts = prompt
             # Tokenize text and preprocess images and audio
             inputs = prepare_inputs(
                 self._processor,
@@ -4934,6 +5175,7 @@ class VLMBatchedEngine(BaseEngine):
             "specprefill_system_end",
             "generation_prompt_text",
             "generation_prompt_persists",
+            "system_prefix_ids",
         ):
             if kwargs.get(key) is not None:
                 specprefill_kwargs[key] = kwargs.pop(key)
@@ -5057,12 +5299,15 @@ class VLMBatchedEngine(BaseEngine):
             presence_penalty=presence_penalty,
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
+            ignore_eos=bool(kwargs.get("ignore_eos", False)),
             stop_token_ids=extra_stop_ids or None,
             thinking_budget=kwargs.get("thinking_budget", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),
             stop_skips_reasoning=kwargs.get("stop_skips_reasoning", False),
             logits_observer=kwargs.get("logits_observer"),
+            logprobs=bool(kwargs.get("logprobs", False)),
+            top_logprobs=kwargs.get("top_logprobs"),
         )
 
         # SpecPrefill: forward per-request overrides to the engine, mirroring
@@ -5073,12 +5318,14 @@ class VLMBatchedEngine(BaseEngine):
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            request_id=kwargs.pop("_request_id", None),
             vlm_inputs_embeds=vlm_inputs_embeds,
             vlm_extra_kwargs=vlm_extra_kwargs,
             vlm_image_hash=vlm_image_hash,
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             tools=tools,
+            skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
             preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
             **specprefill_kwargs,
         )
@@ -5091,6 +5338,7 @@ class VLMBatchedEngine(BaseEngine):
             completion_tokens=output.completion_tokens,
             finish_reason=output.finish_reason,
             tool_calls=output.tool_calls,
+            logprobs=output.logprobs,
             cached_tokens=output.cached_tokens,
             first_token_at=output.first_token_at,
         )
@@ -5175,12 +5423,15 @@ class VLMBatchedEngine(BaseEngine):
             presence_penalty=presence_penalty,
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
+            ignore_eos=bool(kwargs.get("ignore_eos", False)),
             stop_token_ids=extra_stop_ids or None,
             thinking_budget=kwargs.get("thinking_budget", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),
             stop_skips_reasoning=kwargs.get("stop_skips_reasoning", False),
             logits_observer=kwargs.get("logits_observer"),
+            logprobs=bool(kwargs.get("logprobs", False)),
+            top_logprobs=kwargs.get("top_logprobs"),
         )
 
         # SpecPrefill: pass per-request overrides
@@ -5223,6 +5474,7 @@ class VLMBatchedEngine(BaseEngine):
                     finished=output.finished,
                     finish_reason=output.finish_reason,
                     tool_calls=output.tool_calls,
+                    logprobs=output.logprobs,
                     cached_tokens=output.cached_tokens,
                     generated_at=getattr(output, "generated_at", None),
                     generated_until=getattr(output, "generated_until", None),
@@ -5320,6 +5572,11 @@ class VLMBatchedEngine(BaseEngine):
         if generation_prompt:
             kwargs["generation_prompt_text"] = generation_prompt
             kwargs["generation_prompt_persists"] = persists
+        system_prefix = self._system_prefix_ids(
+            messages, convert_tools_for_template(tools) if tools else None, ct_kwargs
+        )
+        if system_prefix:
+            kwargs["system_prefix_ids"] = system_prefix
 
         return await self.generate(
             prompt=prompt,
@@ -5406,11 +5663,11 @@ class VLMBatchedEngine(BaseEngine):
         _, text_messages, images, _, videos = self._extract_request_media(messages)
         if (
             images
-            and self.model_type in {"gemma4", "gemma4_unified"}
+            and self.model_type in {"gemma4", "gemma4_unified", "muse_spark"}
             and self._vlm_model.config.vision_config is None
         ):
             raise InvalidRequestError(
-                "This text-only Gemma 4 model does not support image input.",
+                "This text-only model does not support image input.",
                 field="messages",
             )
         # Validate the explicit image mode early so preflight fails fast on
@@ -5574,6 +5831,11 @@ class VLMBatchedEngine(BaseEngine):
         if generation_prompt:
             kwargs["generation_prompt_text"] = generation_prompt
             kwargs["generation_prompt_persists"] = persists
+        system_prefix = self._system_prefix_ids(
+            messages, convert_tools_for_template(tools) if tools else None, ct_kwargs
+        )
+        if system_prefix:
+            kwargs["system_prefix_ids"] = system_prefix
 
         async for output in self.stream_generate(
             prompt=prompt,
@@ -5594,6 +5856,17 @@ class VLMBatchedEngine(BaseEngine):
         ):
             yield output
 
+    def _is_unlimited_ocr_2(self) -> bool:
+        """True for Unlimited-OCR-2, whose decoder uses DASH sparse attention."""
+        config = getattr(self._vlm_model, "config", None)
+        text_config = getattr(config, "text_config", None)
+        sparse = getattr(text_config, "sparse_attention_config", None)
+        return (
+            self.model_type == "unlimited-ocr"
+            and isinstance(sparse, dict)
+            and sparse.get("training_stage") == "dash"
+        )
+
     def _apply_ocr_prompt(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Apply a default OCR prompt only when the user sends no text.
 
@@ -5613,6 +5886,8 @@ class VLMBatchedEngine(BaseEngine):
             return messages
 
         ocr_prompt = OCR_MODEL_PROMPTS[model_type]
+        if self._is_unlimited_ocr_2():
+            ocr_prompt = UNLIMITED_OCR_2_PROMPT
         messages = copy.deepcopy(messages)
 
         # Find last user message
@@ -6249,6 +6524,8 @@ class VLMBatchedEngine(BaseEngine):
 
     def has_active_requests(self) -> bool:
         """Check if the engine has active in-flight requests."""
+        if getattr(self, "_speech_active", 0):
+            return True
         if self.is_diffusion_model:
             return getattr(self, "_diffusion_active_requests", 0) > 0
         engine_core = getattr(self, "_engine", None)

@@ -39,17 +39,18 @@ final class ModelSettingsScreenVM {
         case temperature, topP, topK, minP
         case repetitionPenalty, presencePenalty, ttl
         case enableThinking, ssdNgramOffload
-        case deepseekV41CedPrefill, qwen4GdnDecodeWideProj
+        case deepseekV41CedPrefill, qwen4GdnDecodeWideProj, activationFp16
         case thinkingBudgetEnabled, thinkingBudgetTokens
         case limitToolResults, toolResultLimitTokens
+        case limitGpuPower, gpuPowerLimitWatts
         case forceSampling, isPinned, isFavorite
         case trustRemoteCode, externalEngine
         case embeddingAudioEnabled, embeddingAudioMaxSeconds
         case reasoningParser
         case chatTemplateKwargs
-        case turboquantKvEnabled, turboquantKvBits
+        case turboquantKvEnabled, turboquantKvScheme, turboquantKvBits
         case qwen35AnePrefillSharedFraction
-        case qwen35OqA8Enabled, qwen35OqA8MinTokens
+        case a8PrefillEnabled, a8PrefillMinTokens
         case qwen35AnePrefillEnabled, qwen35AnePrefillSequenceLength
         case qwen35AnePrefillTailPaddingMinTokens
         case qwen35AnePrefillFraction, qwen35AnePrefillMaxLayers
@@ -97,6 +98,14 @@ final class ModelSettingsScreenVM {
             ("decision", String(localized: "settings.model_type.decision",
                                 defaultValue: "Decision",
                                 comment: "Model type option label for decision models served by /v1/systemone")),
+        ]
+    }
+
+    static var turboquantKvSchemeOptions: [(String, String)] {
+        [
+            ("turboquant", "TurboQuant"),
+            ("affine4", "Affine4 · 4-bit"),
+            ("affine8", "Affine8 · 8-bit"),
         ]
     }
 
@@ -231,6 +240,7 @@ final class ModelSettingsScreenVM {
     var allModels: [ModelDTO] = []
     var modelID: String = ""
     var lastError: String?
+    var isImportingMtplxSidecar: Bool = false
 
     // Basic
     var alias: String = ""
@@ -255,6 +265,7 @@ final class ModelSettingsScreenVM {
     var deepseekV41EngramSsdOffloadForced: Bool = false
     var deepseekV41CedPrefillEnabled: Bool = false
     var qwen4GdnDecodeWideProj: Bool = false
+    var activationFp16Enabled: Bool = false
     var thinkingBudgetEnabled: Bool = false
     var thinkingBudgetTokens: String = "8192"
     var limitToolResults: Bool = false
@@ -263,6 +274,8 @@ final class ModelSettingsScreenVM {
     /// sensible number instead of zero (which the server interprets as
     /// "disabled").
     var toolResultLimitTokens: String = "4096"
+    var limitGpuPower: Bool = false
+    var gpuPowerLimitWatts: String = "10"
     var forceSampling: Bool = false
     var isPinned: Bool = false
     var isFavorite: Bool = false
@@ -272,6 +285,14 @@ final class ModelSettingsScreenVM {
 
     /// External engine serving the model; empty runs it in-process.
     var externalEngine: String = ""
+
+    /// The engine that serves the model: the setting, or for a GGUF, which
+    /// only an external engine runs, the first engine that can serve it.
+    var effectiveExternalEngine: String {
+        guard externalEngine.isEmpty, model?.isGGUF == true else { return externalEngine }
+        let engines = model?.externalEngines ?? []
+        return engines.first(where: { $0.compatible })?.id ?? engines.first?.id ?? ""
+    }
 
     // Embedding audio tower. Empty seconds keeps the 30 s processor default.
     var embeddingAudioEnabled: Bool = false
@@ -296,14 +317,15 @@ final class ModelSettingsScreenVM {
 
     // Experimental: TurboQuant KV
     var turboquantKvEnabled: Bool = false
+    var turboquantKvScheme: String = "turboquant"
     var turboquantKvBits: String = "4"
 
     // Experimental: oQ mixed-bit INT8-activation prefill kernels. There is no
     // layout to choose: the kernel reads the checkpoint's own packed weight
     // stream, so it is both the fastest option and the one that costs no extra
     // memory. The tile is picked per bit width by the dispatcher.
-    var qwen35OqA8Enabled: Bool = false
-    var qwen35OqA8MinTokens: String = "128"
+    var a8PrefillEnabled: Bool = false
+    var a8PrefillMinTokens: String = "128"
 
     // Experimental: private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill.
     // These defaults are the measured M3 Ultra optimum for the 2,048-token
@@ -456,6 +478,12 @@ final class ModelSettingsScreenVM {
 
     var showsGenerationSection: Bool { isLLMLike }
 
+    /// Embedding requests without max_length truncate input to the context window.
+    var showsEmbeddingContextWindow: Bool { model?.modelType == "embedding" }
+
+    /// Rerank requests without max_length use the context window as their limit.
+    var showsRerankerContextWindow: Bool { model?.modelType == "reranker" }
+
     /// Acceleration, Memory Saving and Experimental only apply to the MLX
     /// LLM engines.
     var showsEnginePages: Bool { isLLMLike && !isDiffusionModel }
@@ -523,23 +551,30 @@ final class ModelSettingsScreenVM {
     }
 
     var embeddingAudioSupported: Bool { model?.embeddingAudioSupported == true }
+    var gpuPowerLimitSupported: Bool { model?.gpuPowerLimitSupported == true }
+    /// The watt value when it is in the range the server accepts.
+    private var validGpuPowerLimitWatts: Int? {
+        Int(gpuPowerLimitWatts).flatMap { (2...1000).contains($0) ? $0 : nil }
+    }
 
     private func isDiffusionUnsupportedField(_ field: Field) -> Bool {
         switch field {
         case .topP, .topK, .minP, .repetitionPenalty, .presencePenalty:
             return true
         case .enableThinking, .ssdNgramOffload,
-             .deepseekV41CedPrefill, .qwen4GdnDecodeWideProj,
+             .deepseekV41CedPrefill, .qwen4GdnDecodeWideProj, .activationFp16,
              .thinkingBudgetEnabled, .thinkingBudgetTokens:
             return true
         case .limitToolResults, .toolResultLimitTokens:
             return true
+        case .limitGpuPower, .gpuPowerLimitWatts:
+            return false
         case .forceSampling, .reasoningParser:
             return true
-        case .turboquantKvEnabled, .turboquantKvBits:
+        case .turboquantKvEnabled, .turboquantKvScheme, .turboquantKvBits:
             return true
         case .qwen35AnePrefillSharedFraction,
-             .qwen35OqA8Enabled, .qwen35OqA8MinTokens:
+             .a8PrefillEnabled, .a8PrefillMinTokens:
             return true
         case .qwen35AnePrefillEnabled, .qwen35AnePrefillSequenceLength,
              .qwen35AnePrefillTailPaddingMinTokens:
@@ -704,6 +739,7 @@ final class ModelSettingsScreenVM {
                     || (s?.deepseekV41EngramSsdOffload ?? false)
                 self.deepseekV41CedPrefillEnabled = s?.deepseekV41CedPrefillEnabled ?? false
                 self.qwen4GdnDecodeWideProj = s?.qwen4GdnDecodeWideProj ?? false
+                self.activationFp16Enabled = s?.activationFp16Enabled ?? false
                 self.thinkingBudgetEnabled = s?.thinkingBudgetEnabled ?? false
                 self.thinkingBudgetTokens = s?.thinkingBudgetTokens.map(String.init) ?? "8192"
                 self.limitToolResults = (s?.maxToolResultTokens ?? 0) > 0
@@ -711,6 +747,13 @@ final class ModelSettingsScreenVM {
                     self.toolResultLimitTokens = String(n)
                 } else {
                     self.toolResultLimitTokens = "4096"
+                }
+                if let watts = s?.gpuPowerLimitW, watts > 0 {
+                    self.limitGpuPower = true
+                    self.gpuPowerLimitWatts = String(watts)
+                } else {
+                    self.limitGpuPower = false
+                    self.gpuPowerLimitWatts = "10"
                 }
                 self.forceSampling = s?.forceSampling ?? false
                 self.isPinned = s?.isPinned ?? false
@@ -733,10 +776,11 @@ final class ModelSettingsScreenVM {
                     )
                 )
                 self.turboquantKvEnabled = s?.turboquantKvEnabled ?? false
+                self.turboquantKvScheme = s?.turboquantKvScheme ?? "turboquant"
                 self.turboquantKvBits = s?.turboquantKvBits.map { Self.formatBits($0) } ?? "4"
                 self.qwen35AnePrefillSharedFraction = s?.qwen35AnePrefillSharedFraction.map { String($0) } ?? "1"
-                self.qwen35OqA8Enabled = s?.qwen35OqA8Enabled ?? false
-                self.qwen35OqA8MinTokens = s?.qwen35OqA8MinTokens.map(String.init) ?? "128"
+                self.a8PrefillEnabled = s?.a8PrefillEnabled ?? false
+                self.a8PrefillMinTokens = s?.a8PrefillMinTokens.map(String.init) ?? "128"
                 self.qwen35AnePrefillEnabled = s?.qwen35AnePrefillEnabled ?? false
                 self.qwen35AnePrefillSequenceLength = s?.qwen35AnePrefillSequenceLength.map(String.init) ?? "2048"
                 self.qwen35AnePrefillTailPaddingMinTokens = s?.qwen35AnePrefillTailPaddingMinTokens.map(String.init) ?? "0"
@@ -862,6 +906,7 @@ final class ModelSettingsScreenVM {
         case .qwen4GdnDecodeWideProj:
             guard isQwen4Exp else { return }
             patch.qwen4GdnDecodeWideProj = qwen4GdnDecodeWideProj
+        case .activationFp16:          patch.activationFp16Enabled = activationFp16Enabled
         case .thinkingBudgetEnabled:   patch.thinkingBudgetEnabled = thinkingBudgetEnabled
         case .thinkingBudgetTokens:    patch.thinkingBudgetTokens = Int(thinkingBudgetTokens)
         case .limitToolResults:
@@ -878,6 +923,11 @@ final class ModelSettingsScreenVM {
             guard limitToolResults else { return }
             guard let n = Int(toolResultLimitTokens), n > 0 else { return }
             patch.maxToolResultTokens = n
+        case .limitGpuPower:
+            patch.gpuPowerLimitW = limitGpuPower ? (validGpuPowerLimitWatts ?? 10) : 0
+        case .gpuPowerLimitWatts:
+            guard limitGpuPower, let n = validGpuPowerLimitWatts else { return }
+            patch.gpuPowerLimitW = n
         case .forceSampling:           patch.forceSampling = forceSampling
         case .isPinned:                patch.isPinned = isPinned
         case .isFavorite:              patch.isFavorite = isFavorite
@@ -904,17 +954,26 @@ final class ModelSettingsScreenVM {
             patch.chatTemplateKwargs = pair.kwargs ?? [:]
             patch.forcedCtKwargs = pair.forced ?? []
         case .turboquantKvEnabled:     patch.turboquantKvEnabled = turboquantKvEnabled
+        case .turboquantKvScheme:
+            patch.turboquantKvScheme = turboquantKvScheme
+            if turboquantKvScheme == "affine4" {
+                turboquantKvBits = "4"
+                patch.turboquantKvBits = 4
+            } else if turboquantKvScheme == "affine8" {
+                turboquantKvBits = "8"
+                patch.turboquantKvBits = 8
+            }
         case .turboquantKvBits:        patch.turboquantKvBits = Double(turboquantKvBits)
         case .qwen35AnePrefillSharedFraction:
             guard validateAneWorkingSettings() else { return }
             patch.qwen35AnePrefillSharedFraction = Double(qwen35AnePrefillSharedFraction)
-        case .qwen35OqA8Enabled:  patch.qwen35OqA8Enabled = qwen35OqA8Enabled
-        case .qwen35OqA8MinTokens:
-            guard let value = Int(qwen35OqA8MinTokens), value >= 1 else {
-                lastError = "oQ A8 minimum prompt tokens must be a positive integer."
+        case .a8PrefillEnabled:  patch.a8PrefillEnabled = a8PrefillEnabled
+        case .a8PrefillMinTokens:
+            guard let value = Int(a8PrefillMinTokens), value >= 1 else {
+                lastError = "A8 minimum prompt tokens must be a positive integer."
                 return
             }
-            patch.qwen35OqA8MinTokens = value
+            patch.a8PrefillMinTokens = value
         case .qwen35AnePrefillEnabled: patch.qwen35AnePrefillEnabled = qwen35AnePrefillEnabled
         case .qwen35AnePrefillSequenceLength:
             guard validateAneWorkingSettings() else { return }
@@ -1091,7 +1150,7 @@ final class ModelSettingsScreenVM {
             // The two prefill accelerators are mutually exclusive, and the
             // tuner's recommendation is the more specific answer here: it was
             // measured on this model's own layers.
-            qwen35OqA8Enabled = false
+            a8PrefillEnabled = false
         }
         qwen35AnePrefillSequenceLength = String(recommendation.sequenceLength)
         if let fraction = recommendation.mlpFraction { qwen35AnePrefillFraction = String(fraction) }
@@ -1222,10 +1281,10 @@ final class ModelSettingsScreenVM {
         return Self.dsaConfigModelTypes.contains(type)
     }
 
-    var isQwenOqA8Model: Bool {
-        // qwen4_exp (Qwen3.8-Flash-Next) matches exactly: only that validated
-        // family has routed-expert A8, not every qwen4*.
-        if isQwen4Exp { return true }
+    var isA8PrefillModel: Bool {
+        // qwen4_exp (Qwen3.8-Flash-Next) and DeepSeek V4.1 match exactly: only
+        // those validated families have routed-expert A8, not every qwen4*.
+        if isQwen4Exp || isDeepseekV41 { return true }
         let type = (model?.configModelType ?? "").lowercased().replacingOccurrences(of: "-", with: "_")
         return ["qwen3_5", "qwen3_6", "qwen3_8"].contains { type.hasPrefix($0) }
     }
@@ -1235,9 +1294,9 @@ final class ModelSettingsScreenVM {
     /// The INT8 kernels run only on GPUs with native INT8 tensor ops
     /// (M5-series or newer). A saved "on" keeps the row so it can be
     /// turned off.
-    var showsQwenOqA8: Bool {
-        isQwenOqA8Model
-            && (model?.qwen35OqA8Supported == true || model?.settings?.qwen35OqA8Enabled == true)
+    var showsA8Prefill: Bool {
+        isA8PrefillModel
+            && (model?.a8PrefillSupported == true || model?.settings?.a8PrefillEnabled == true)
     }
 
     /// Native Lightning MTP can't co-exist with the other speculative
@@ -1288,7 +1347,20 @@ final class ModelSettingsScreenVM {
     /// Streamed experts cannot back a speculative decoder, except the
     /// Lightning MTP head of families that keep it resident. Mirrors
     /// `validate_moe_expert_offload` on the server.
+    /// The server rejects the recast together with MoE expert offload.
+    var activationFp16ConflictReason: String? {
+        guard moeExpertOffloadEnabled else { return nil }
+        return String(localized: "settings.advanced.activation_fp16.conflict.moe_offload",
+                      defaultValue: "Disable MoE Expert Offload before enabling Float16 Activations.",
+                      comment: "Sublabel shown when the float16 activation recast can't be enabled because MoE expert offload is on")
+    }
+
     var moeExpertOffloadConflictReason: String? {
+        if activationFp16Enabled {
+            return String(localized: "settings.moe_offload.conflict.activation_fp16",
+                          defaultValue: "Disable Float16 Activations before enabling MoE Expert Offload.",
+                          comment: "Tooltip / sublabel shown when MoE expert offload can't be enabled because the float16 activation recast is on")
+        }
         if mtpEnabled && model?.moeOffloadAllowsMtp != true {
             return String(localized: "settings.moe_offload.conflict.mtp",
                           defaultValue: "Disable Lightning MTP before enabling MoE Expert Offload.",
@@ -1312,7 +1384,7 @@ final class ModelSettingsScreenVM {
     /// charge and the other silently inert. The server rejects the pair; these
     /// mirror that so the losing toggle disables itself and says why instead
     /// of the save returning a 400 with the switch already flipped.
-    var qwen35OqA8ConflictReason: String? {
+    var a8PrefillConflictReason: String? {
         guard qwen35AnePrefillEnabled else { return nil }
         return String(localized: "settings.qwen_oq_a8.conflict.ane",
                       defaultValue: "Disable Qwen ANE Prefill before enabling INT8 activation prefill.",
@@ -1320,10 +1392,34 @@ final class ModelSettingsScreenVM {
     }
 
     var qwen35AnePrefillConflictReason: String? {
-        guard qwen35OqA8Enabled else { return nil }
+        guard a8PrefillEnabled else { return nil }
         return String(localized: "settings.qwen_ane.conflict.oq_a8",
                       defaultValue: "Disable Qwen INT8 Activation Prefill before enabling ANE prefill.",
                       comment: "Tooltip / sublabel shown when ANE prefill can't be enabled because INT8 activation prefill is on")
+    }
+
+    /// MTPLX checkpoints keep MTP weights in a sidecar until the server
+    /// imports them into the model index. Match the server-provided
+    /// compatibility marker rather than guessing from model names.
+    var canImportMtplxSidecar: Bool {
+        guard model?.mtpCompatible == false,
+              let reason = model?.mtpCompatibilityReason else {
+            return false
+        }
+        return reason.localizedCaseInsensitiveContains("MTPLX side-car")
+    }
+
+    func importMtplxSidecar(client: OMLXClient) async {
+        guard !isImportingMtplxSidecar, canImportMtplxSidecar else { return }
+        isImportingMtplxSidecar = true
+        defer { isImportingMtplxSidecar = false }
+
+        do {
+            _ = try await client.importMtplxSidecar(id: modelID)
+            await load(modelID: modelID, client: client, preservingEdits: true)
+        } catch {
+            lastError = error.omlxDescription
+        }
     }
 
     /// VLM MTP wraps mlx-vlm's MTP loop and is mutually exclusive with the
@@ -1417,7 +1513,7 @@ final class ModelSettingsScreenVM {
             }
             return profileDisplayName(scope: activeProfileScope, name: name)
         case .acceleration, .memory, .experimental:
-            if !externalEngine.isEmpty { return Self.summaryExternalEngine }
+            if !effectiveExternalEngine.isEmpty { return Self.summaryExternalEngine }
             return Self.summary(enabledFeatures(on: page), empty: Self.summaryOff)
         case .advanced:
             return Self.summary(enabledFeatures(on: .advanced), empty: Self.summaryOff)
@@ -1456,7 +1552,7 @@ final class ModelSettingsScreenVM {
                                     defaultValue: "Extended Fused Decode",
                                     comment: "Short name of Qwen4 extended fused decode in the Acceleration row value"))
             }
-            if showsQwenOqA8 && qwen35OqA8Enabled {
+            if showsA8Prefill && a8PrefillEnabled {
                 items.append(String(localized: "settings.summary.qwen_oq_a8",
                                     defaultValue: "INT8 Prefill",
                                     comment: "Short name of Qwen INT8 activation prefill in the Acceleration row value"))
@@ -1479,21 +1575,27 @@ final class ModelSettingsScreenVM {
                                     comment: "TurboQuant KV in the Memory Saving row value; placeholder is the bit width"))
             }
         case .advanced:
-            if !isDiffusionModel, !externalEngine.isEmpty {
-                let label = model?.externalEngines?.first(where: { $0.id == externalEngine })?.label
-                items.append(label ?? externalEngine)
+            if !isDiffusionModel, !effectiveExternalEngine.isEmpty {
+                let engine = effectiveExternalEngine
+                let label = model?.externalEngines?.first(where: { $0.id == engine })?.label
+                items.append(label ?? engine)
             }
             if trustRemoteCode {
                 items.append(String(localized: "settings.advanced.trust_remote_code.label",
                                     defaultValue: "Trust Remote Code",
                                     comment: "Row label for the security-sensitive trust-remote-code toggle"))
             }
+            if isLLMLike && !isDiffusionModel && thinkingBudgetEnabled {
+                items.append(String(localized: "settings.advanced.thinking_budget.label",
+                                    defaultValue: "Thinking Budget",
+                                    comment: "Row label for the thinking budget field"))
+            }
+            if isLLMLike && limitGpuPower {
+                items.append(String(localized: "settings.summary.gpu_power_limit",
+                                    defaultValue: "GPU \(gpuPowerLimitWatts) W",
+                                    comment: "GPU power limit in the Advanced row value; placeholder is the watt value"))
+            }
             if isLLMLike && !isDiffusionModel {
-                if thinkingBudgetEnabled {
-                    items.append(String(localized: "settings.advanced.thinking_budget.label",
-                                        defaultValue: "Thinking Budget",
-                                        comment: "Row label for the thinking budget field"))
-                }
                 if limitToolResults {
                     items.append(String(localized: "settings.summary.tool_result_limit",
                                         defaultValue: "Tool Result Limit",
@@ -1628,6 +1730,9 @@ final class ModelSettingsScreenVM {
                 limitToolResults ? (Int(toolResultLimitTokens) ?? 4096) : 0
             )
         }
+        out[ProfileSettingsKey.gpuPowerLimitW] = AnyCodable(
+            limitGpuPower ? (Int(gpuPowerLimitWatts) ?? 10) : 0
+        )
 
         // Universal — chat template kwargs. AnyCodable's encode walks a
         // [String: AnyCodable] / [AnyCodable] explicitly, so nest those
@@ -1653,12 +1758,17 @@ final class ModelSettingsScreenVM {
                 }
             }
             putBool(ProfileSettingsKey.turboquantKvEnabled, turboquantKvEnabled)
-            if turboquantKvEnabled, let bits = Double(turboquantKvBits) {
-                out[ProfileSettingsKey.turboquantKvBits] = AnyCodable(bits)
+            if turboquantKvEnabled {
+                putString(ProfileSettingsKey.turboquantKvScheme, turboquantKvScheme)
+                let fixedBits = turboquantKvScheme == "affine4"
+                    ? 4.0 : turboquantKvScheme == "affine8" ? 8.0 : nil
+                if let bits = fixedBits ?? Double(turboquantKvBits) {
+                    out[ProfileSettingsKey.turboquantKvBits] = AnyCodable(bits)
+                }
             }
-            putBool(ProfileSettingsKey.qwen35OqA8Enabled, qwen35OqA8Enabled)
-            if qwen35OqA8Enabled {
-                putInt(ProfileSettingsKey.qwen35OqA8MinTokens, qwen35OqA8MinTokens)
+            putBool(ProfileSettingsKey.a8PrefillEnabled, a8PrefillEnabled)
+            if a8PrefillEnabled {
+                putInt(ProfileSettingsKey.a8PrefillMinTokens, a8PrefillMinTokens)
             }
             putBool(ProfileSettingsKey.qwen35AnePrefillEnabled, qwen35AnePrefillEnabled)
             if qwen35AnePrefillEnabled {
@@ -2089,6 +2199,12 @@ final class ModelSettingsScreenVM {
     }
 
     private func validateWorkingSettings() -> Bool {
+        if limitGpuPower, validGpuPowerLimitWatts == nil {
+            lastError = String(localized: "settings.advanced.gpu_power_limit.range",
+                               defaultValue: "GPU power limit must be between 2 and 1000 W.",
+                               comment: "Error when the GPU power limit is outside the accepted range")
+            return false
+        }
         if moeExpertOffloadSupported, moeExpertOffloadEnabled,
            moeExpertOffloadResidentFraction == nil {
             lastError = moeResidentRangeError

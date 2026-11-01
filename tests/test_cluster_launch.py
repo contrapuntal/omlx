@@ -302,6 +302,67 @@ def test_ring_launch_reserves_full_collective_port_span():
     )
 
 
+def test_launch_ports_stay_below_the_ephemeral_window():
+    low, high = launch._SAFE_PORT_RANGE
+
+    for _ in range(8):
+        api_port, collective_port = _available_launch_ports(_deployment())
+        assert low <= api_port <= high
+        assert low <= collective_port <= high
+
+
+def test_reap_stale_remote_workers_kills_only_peer_workers(monkeypatch):
+    scanned = []
+    killed = []
+
+    def fake_scan(ssh_target, deployment_id, *, runner):
+        scanned.append((ssh_target, deployment_id))
+        return [4711, 4712], ""
+
+    def fake_kill(ssh_target, pid, *, grace, runner):
+        killed.append((ssh_target, pid))
+        return True
+
+    monkeypatch.setattr(launch, "_remote_deployment_worker_pids", fake_scan)
+    monkeypatch.setattr(launch, "_kill_remote_pid", fake_kill)
+
+    launch._reap_stale_remote_workers(_deployment())
+
+    assert scanned == [("user@studio.local", "cluster-test")]
+    assert killed == [("user@studio.local", 4711), ("user@studio.local", 4712)]
+
+
+@pytest.mark.parametrize(
+    ("scan", "message"),
+    [
+        ((None, "ssh transport broken"), "ssh transport broken"),
+        (([4711], ""), r"survived SIGKILL.*Reboot"),
+    ],
+)
+def test_reap_stale_remote_workers_blocks_launch(monkeypatch, scan, message):
+    monkeypatch.setattr(
+        launch, "_remote_deployment_worker_pids", lambda *_a, **_k: scan
+    )
+    monkeypatch.setattr(launch, "_kill_remote_pid", lambda *_a, **_k: False)
+
+    with pytest.raises(launch.DistributedLaunchError, match=message):
+        launch._reap_stale_remote_workers(_deployment())
+
+
+def test_remote_worker_scan_quotes_peer_stderr_when_output_is_not_json():
+    def runner(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            argv, 0, stdout="", stderr="No user exists for uid 501"
+        )
+
+    pids, error = launch._remote_deployment_worker_pids(
+        "user@spark-a", "cluster-test", runner=runner
+    )
+
+    assert pids is None
+    assert "No user exists for uid 501" in error
+
+
 def test_supervisor_preserves_structured_peer_loss_reason():
     supervisor = launch.DistributedJobSupervisor(_deployment(), preflight=False)
     reason = "rank 1 on studio stopped reporting"
@@ -347,6 +408,34 @@ def test_rank_exit_detail_waits_for_rank_stderr_forwarded_after_the_exit_line():
         match=r"(?s)rank 0 exited with code 1.*side-channel helper stopped",
     ):
         supervisor._wait_for_ready()
+
+
+def test_rank_exit_detail_includes_remote_rank_output_from_stdout():
+    supervisor = launch.DistributedJobSupervisor(_deployment(), preflight=False)
+    supervisor.process = SimpleNamespace(poll=lambda: None)
+
+    # Remote ranks run under ssh -tt, so their stderr reaches the launcher's stdout.
+    supervisor._drain(
+        io.StringIO(
+            f'{launch._EVENT_PREFIX}{{"type":"rank_ready","rank":0}}\n'
+            "ImportError: libcudart.so.13: cannot open shared object file\r\n"
+        ),
+        supervisor._stdout,
+        True,
+    )
+    supervisor._drain(
+        io.StringIO("[WARN] Node with rank 1 exited with code 1\n"),
+        supervisor._stderr,
+        False,
+    )
+
+    with pytest.raises(launch.DistributedLaunchError) as excinfo:
+        supervisor._wait_for_ready()
+
+    detail = str(excinfo.value)
+    assert "rank 1 exited with code 1" in detail
+    assert "ImportError: libcudart.so.13" in detail
+    assert launch._EVENT_PREFIX not in detail
 
 
 def test_supervisor_prefers_rank_marker_over_mlx_cleanup_traceback(monkeypatch):
@@ -1551,6 +1640,25 @@ def test_prompt_cache_ssd_can_be_turned_off(tmp_path):
         prompt_cache_ssd=False, state_dir=str(tmp_path), deployment_id="d"
     )
     assert _prompt_cache_ssd_dir(off, rank=0) is None
+
+
+def test_lightning_mtp_reaches_the_rank_load_settings(tmp_path):
+    from omlx.cluster.inference_worker import _mtp_load_settings
+
+    deployment = _deployment()
+    args, _plan_hash, _assignments = _parsed_plan(deployment, tmp_path)
+    assert _mtp_load_settings(args) is None
+
+    execution = replace(
+        deployment.execution, mtp=True, mtp_depth=3, mtp_fixed_depth=True
+    )
+    args, _plan_hash, _assignments = _parsed_plan(
+        replace(deployment, execution=execution), tmp_path
+    )
+    settings = _mtp_load_settings(args)
+    assert settings.mtp_enabled is True
+    assert settings.mtp_fixed_depth == 3
+    assert settings.mtp_adaptive_max_depth is None
 
 
 def test_the_node_role_reaches_the_rank_through_the_launched_argv(tmp_path):

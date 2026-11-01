@@ -65,8 +65,9 @@ brew update && brew upgrade omlx
 # バックグラウンドサービスとして実行（クラッシュ時に自動再起動）
 brew services start omlx
 
-# オプション: MCP（Model Context Protocol）サポート
+# オプション: MCP（Model Context Protocol）サポート。読み込むには再起動
 /opt/homebrew/opt/omlx/libexec/bin/pip install mcp
+omlx restart
 ```
 
 ### ソースからインストール
@@ -76,7 +77,7 @@ git clone https://github.com/jundot/omlx.git
 cd omlx
 make install                # Web UIとネイティブカスタムカーネルを含むeditableインストール
 # フルXcodeがない場合は make install-no-kernels でカーネルなしでインストール
-make mcp                    # オプション: MCP（Model Context Protocol）サポートを追加
+make mcp                    # オプション: MCP サポートを追加。`omlx serve` の再起動で読み込み
 ```
 
 macOS 15.0+（Sequoia）、Python 3.11–3.13、Apple Silicon（M1/M2/M3/M4/M5）が必要です。
@@ -191,7 +192,7 @@ Claude Codeで小さなコンテキストモデルを実行するため、トー
 
 ### モデルダウンロード
 
-管理画面からHuggingFaceのMLXモデルを直接検索してダウンロードします。モデルカードの確認、ファイルサイズの確認、ワンクリックダウンロードが可能です。
+管理画面からHuggingFaceのモデルをMLX、GGUF、またはすべての形式で直接検索してダウンロードします。モデルカードを確認してからダウンロードするファイルを選べます。MLXチェックポイントは必要なファイルを常にダウンロードし、GGUFはvision projectorも一緒にダウンロードします。
 
 <p align="center">
   <img src="docs/images/downloader_omlx.png" alt="oMLX モデルダウンロード" width="720">
@@ -232,7 +233,7 @@ OpenAIとAnthropic APIのドロップイン代替です。ストリーミング�
 | `POST /v1/messages` | Anthropic Messages API |
 | `POST /v1/embeddings` | テキストエンベディング |
 | `POST /v1/rerank` | ドキュメントリランキング |
-| `POST /v1/systemone` | Decision モデルによる型付き判定 (TypeSafe System One) |
+| `POST /v1/systemone` | Decision モデルまたはチャットモデルによる型付き判定 (TypeSafe System One) |
 | `GET /v1/models` | 利用可能なモデル一覧 |
 | `POST /tokenize`, `POST /detokenize` | vLLM 互換トークナイザー API（`/v1` 配下でも利用可） |
 

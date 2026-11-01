@@ -49,6 +49,8 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     var anePrefillMlpFractions: [Double]? = nil
     var anePrefillSharedFractions: [Double]? = nil
     var embeddingAudioSupported: Bool? = nil
+    /// True when the model can hold a spoken conversation on /v1/realtime.
+    var realtimeVoice: Bool? = nil
     /// External engines that could serve this model, with why not when they
     /// cannot. Empty for models only oMLX's own engines run.
     var externalEngines: [ExternalEngineOption]? = nil
@@ -72,12 +74,18 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     var deepseekV41EngramResidentBytes: Int64? = nil
     var deepseekV41EngramMmapBytes: Int64? = nil
     var moeExpertOffloadSupported: Bool? = nil
+    /// True on M1/M2 for checkpoints that still carry bfloat16 leaves.
+    var activationFp16Supported: Bool? = nil
     /// True for families whose MTP draft head stays resident while experts stream.
     var moeOffloadAllowsMtp: Bool? = nil
     /// True when this Mac can run the Qwen INT8 activation prefill kernels.
-    var qwen35OqA8Supported: Bool? = nil
+    var a8PrefillSupported: Bool? = nil
+    /// True when this Mac's GPU accepts a power cap.
+    var gpuPowerLimitSupported: Bool? = nil
     /// "hf_cache" for models found in the shared Hugging Face Hub cache.
     var sourceType: String? = nil
+    /// "gguf" for a GGUF file, which only an external engine serves.
+    var modelFormat: String? = nil
     /// True for builtin virtual entries (e.g. the MarkItDown document
     /// converter) that have no real load/unload lifecycle.
     let virtual: Bool?
@@ -95,6 +103,7 @@ extension ModelDTO {
     }
 
     var isInHFCache: Bool { sourceType == "hf_cache" }
+    var isGGUF: Bool { modelFormat == "gguf" }
 }
 
 /// One entry of `external_engines` in GET /admin/api/models.
@@ -103,6 +112,8 @@ struct ExternalEngineOption: Codable, Equatable, Sendable, Identifiable {
     let label: String
     let compatible: Bool
     let reason: String?
+    /// Hugging Face repo of the draft the engine lacks, when one provides it.
+    var draftRepo: String? = nil
 }
 
 struct ModelSettingsDTO: Codable, Equatable, Sendable {
@@ -121,10 +132,12 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let enableThinking: Bool?
     let qwen4PleSsdOffload: Bool?
     var qwen4GdnDecodeWideProj: Bool? = nil
+    var activationFp16Enabled: Bool? = nil
     var deepseekV41EngramSsdOffload: Bool? = nil
     var deepseekV41CedPrefillEnabled: Bool? = nil
     let thinkingBudgetEnabled: Bool?
     let thinkingBudgetTokens: Int?
+    var gpuPowerLimitW: Int? = nil
     let reasoningParser: String?
     let ttlSeconds: Int?
     let isPinned: Bool?
@@ -149,6 +162,7 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     var moeExpertOffloadResidentFraction: Double? = nil
     // Experimental: TurboQuant KV cache
     let turboquantKvEnabled: Bool?
+    let turboquantKvScheme: String?
     let turboquantKvBits: Double?
     // Experimental: private Qwen3.5/3.6/3.8 ANE/GPU prefill
     var qwen35AnePrefillSharedFraction: Double? = nil
@@ -169,8 +183,8 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let qwen35AnePrefillCpuThreads: Int?
     let qwen35AnePrefillCpuSharedResource: Bool?
     // Experimental: oQ mixed-bit INT8-activation prefill kernels
-    let qwen35OqA8Enabled: Bool?
-    let qwen35OqA8MinTokens: Int?
+    let a8PrefillEnabled: Bool?
+    let a8PrefillMinTokens: Int?
     // Experimental: IndexCache (DSA models only)
     let indexCacheFreq: Int?
     // Experimental: SpecPrefill
@@ -214,11 +228,13 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var enableThinking: Bool?? = nil // nil omits the key. .some(nil) sends JSON null.
     var qwen4PleSsdOffload: Bool? = nil
     var qwen4GdnDecodeWideProj: Bool? = nil
+    var activationFp16Enabled: Bool? = nil
     var deepseekV41EngramSsdOffload: Bool? = nil
     var deepseekV41CedPrefillEnabled: Bool? = nil
     var thinkingBudgetEnabled: Bool? = nil
     var thinkingBudgetTokens: Int? = nil
     var maxToolResultTokens: Int? = nil
+    var gpuPowerLimitW: Int? = nil // 0 turns the limit off.
     var forceSampling: Bool? = nil
     var isPinned: Bool? = nil
     var isFavorite: Bool? = nil
@@ -233,6 +249,7 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var forcedCtKwargs: [String]? = nil
     // Experimental: TurboQuant KV
     var turboquantKvEnabled: Bool? = nil
+    var turboquantKvScheme: String? = nil
     var turboquantKvBits: Double? = nil
     // Experimental: private Qwen3.5/3.6/3.8 ANE/GPU prefill
     var qwen35AnePrefillSharedFraction: Double? = nil
@@ -253,8 +270,8 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var qwen35AnePrefillCpuThreads: Int? = nil
     var qwen35AnePrefillCpuSharedResource: Bool? = nil
     // Experimental: oQ mixed-bit INT8-activation prefill kernels
-    var qwen35OqA8Enabled: Bool? = nil
-    var qwen35OqA8MinTokens: Int? = nil
+    var a8PrefillEnabled: Bool? = nil
+    var a8PrefillMinTokens: Int? = nil
     // Experimental: IndexCache
     var indexCacheFreq: Int? = nil
     // Experimental: SpecPrefill

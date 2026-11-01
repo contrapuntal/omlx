@@ -14,7 +14,7 @@
                             <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('settings.global.section_label') }}</h2>
                             <h3 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('settings.global.heading') }}</h3>
                             <p class="text-sm text-neutral-500 mt-2">
-                                {{ t('settings.global.restart_notice') }} <span class="badge bg-amber-50 text-amber-600 border-amber-200">{{ t('settings.global.restart_badge') }}</span> {{ t('settings.global.restart_suffix') }}
+                                {{ t('settings.global.restart_notice') }} <span class="badge bg-amber-50 text-amber-700 border-amber-200">{{ t('settings.global.restart_badge') }}</span> {{ t('settings.global.restart_suffix') }}
                             </p>
                         </div>
                         <button type="button" @click="resetGlobalSettingsDefaults()"
@@ -110,6 +110,13 @@
                                                     'theme', "setTheme('{value}')", aria_label=t('chat.theme_label')) }}
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <label class="text-sm text-neutral-700">{{ t('settings.appearance.number_scale') }}</label>
+                                    {{ ui.segmented([('compact', t('settings.appearance.number_scale_compact')),
+                                                     ('exact', t('settings.appearance.number_scale_exact'))],
+                                                    'statsNumberScale', "setStatsNumberScale('{value}')",
+                                                    aria_label=t('settings.appearance.number_scale')) }}
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
                                         <label class="text-sm text-neutral-700">{{ t('chat.enhanced_readability') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('chat.enhanced_readability_desc') }}</p>
@@ -181,8 +188,10 @@
                                     <button type="button"
                                             @click="if (isLoopbackBindHost(globalSettings.server.host)) globalSettings.auth.skip_api_key_verification = !globalSettings.auth.skip_api_key_verification"
                                             :disabled="!isLoopbackBindHost(globalSettings.server.host)"
-                                            :class="!isLoopbackBindHost(globalSettings.server.host) ? 'bg-neutral-200 opacity-50 cursor-not-allowed' : (globalSettings.auth.skip_api_key_verification ? 'bg-black' : 'bg-neutral-200')"
-                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                            :class="!isLoopbackBindHost(globalSettings.server.host) ? 'bg-neutral-200 opacity-50 cursor-not-allowed' : (globalSettings.auth.skip_api_key_verification ? 'bg-red-600' : 'bg-neutral-200')"
+                                            role="switch"
+                                            :aria-checked="isLoopbackBindHost(globalSettings.server.host) && globalSettings.auth.skip_api_key_verification ? 'true' : 'false'"
+                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500">
                                         <span :class="isLoopbackBindHost(globalSettings.server.host) && globalSettings.auth.skip_api_key_verification ? 'translate-x-5' : 'translate-x-0'"
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                     </button>
@@ -194,6 +203,8 @@
                                     </div>
                                     <button type="button" @click="toggleUnauthenticatedInference()"
                                             :class="globalSettings.auth.allow_unauthenticated_inference ? 'bg-red-600' : 'bg-neutral-200'"
+                                            role="switch"
+                                            :aria-checked="globalSettings.auth.allow_unauthenticated_inference ? 'true' : 'false'"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500">
                                         <span :class="globalSettings.auth.allow_unauthenticated_inference ? 'translate-x-5' : 'translate-x-0'"
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -312,7 +323,7 @@
                                      }">
                                     <div class="flex items-center gap-2">
                                         <label class="text-sm text-neutral-700">{{ t('settings.server.host') }}</label>
-                                        <span class="badge bg-amber-50 text-amber-600 border-amber-200">{{ t('settings.global.restart_badge') }}</span>
+                                        <span class="badge bg-amber-50 text-amber-700 border-amber-200">{{ t('settings.global.restart_badge') }}</span>
                                     </div>
                                     <div class="flex flex-col items-end gap-1">
                                         <div class="flex items-center gap-2">
@@ -334,7 +345,7 @@
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div class="flex items-center gap-2">
                                         <label class="text-sm text-neutral-700">{{ t('settings.server.port') }}</label>
-                                        <span class="badge bg-amber-50 text-amber-600 border-amber-200">{{ t('settings.global.restart_badge') }}</span>
+                                        <span class="badge bg-amber-50 text-amber-700 border-amber-200">{{ t('settings.global.restart_badge') }}</span>
                                     </div>
                                     <input type="number" x-model.number="globalSettings.server.port"
                                            class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
@@ -379,6 +390,8 @@
                                     <button type="button"
                                             @click="globalSettings.model.model_fallback = !globalSettings.model.model_fallback"
                                             :class="globalSettings.model.model_fallback ? 'bg-black' : 'bg-neutral-200'"
+                                            role="switch"
+                                            :aria-checked="globalSettings.model.model_fallback ? 'true' : 'false'"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="globalSettings.model.model_fallback ? 'translate-x-5' : 'translate-x-0'"
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -392,6 +405,8 @@
                                     <button type="button"
                                             @click="globalSettings.model.hide_helper_models = !globalSettings.model.hide_helper_models"
                                             :class="globalSettings.model.hide_helper_models ? 'bg-black' : 'bg-neutral-200'"
+                                            role="switch"
+                                            :aria-checked="globalSettings.model.hide_helper_models ? 'true' : 'false'"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="globalSettings.model.hide_helper_models ? 'translate-x-5' : 'translate-x-0'"
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -434,6 +449,8 @@
                                     <button type="button"
                                             @click="globalSettings.huggingface.hf_cache_enabled = !globalSettings.huggingface.hf_cache_enabled"
                                             :class="globalSettings.huggingface.hf_cache_enabled ? 'bg-black' : 'bg-neutral-200'"
+                                            role="switch"
+                                            :aria-checked="globalSettings.huggingface.hf_cache_enabled ? 'true' : 'false'"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="globalSettings.huggingface.hf_cache_enabled ? 'translate-x-5' : 'translate-x-0'"
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -456,7 +473,7 @@
                                         <i x-show="settingsCopiedAnchor === 'settings-resource'" x-cloak data-lucide="check" class="w-3.5 h-3.5"></i>
                                     </button>
                                 </div>
-                                <span class="badge bg-green-50 text-green-600 border-green-200">
+                                <span class="badge bg-green-50 text-green-700 border-green-200">
                                     {{ t('settings.resource.live_badge') }}
                                 </span>
                             </div>
@@ -466,7 +483,7 @@
                                     <div>
                                         <div class="flex items-center gap-2">
                                             <label class="text-sm text-neutral-700">{{ t('settings.resource.prefill_memory_guard') }}</label>
-                                            <span class="badge bg-amber-50 text-amber-600 border-amber-200">{{ t('settings.resource.restart_badge') }}</span>
+                                            <span class="badge bg-amber-50 text-amber-700 border-amber-200">{{ t('settings.resource.restart_badge') }}</span>
                                         </div>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.resource.prefill_memory_guard_description') }}</p>
                                         <p class="text-xs text-neutral-500 mt-1"
@@ -514,6 +531,8 @@
                                         <button type="button"
                                                 @click="globalSettings.memory.prefill_memory_guard = !globalSettings.memory.prefill_memory_guard"
                                                 :class="globalSettings.memory.prefill_memory_guard ? 'bg-black' : 'bg-neutral-200'"
+                                                role="switch"
+                                                :aria-checked="globalSettings.memory.prefill_memory_guard ? 'true' : 'false'"
                                                 class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                             <span :class="globalSettings.memory.prefill_memory_guard ? 'translate-x-5' : 'translate-x-0'"
                                                   class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -550,7 +569,7 @@
                                                    x-init="if (editingHotCache) { $nextTick(() => $el.focus()) }"
                                                    class="w-12 px-1 text-sm text-right border border-neutral-900 rounded-lg focus:outline-none"
                                                    min="0"
-                                                   step="1"><span class="text-neutral-400">GB)</span>
+                                                   step="1"><span class="text-neutral-400 ml-1">GB)</span>
                                         </span>
                                     </div>
                                 </div>
@@ -604,7 +623,7 @@
                                             <label class="text-sm text-neutral-700">{{ t('settings.resource.max_concurrent_requests') }}</label>
                                             <!-- Applied live, except to distributed (cluster) engines -->
                                             <span x-show="globalSettings.server.distributed_inference_active" x-cloak
-                                                  class="badge bg-amber-50 text-amber-600 border-amber-200">
+                                                  class="badge bg-amber-50 text-amber-700 border-amber-200">
                                                 {{ t('settings.resource.restart_badge') }}
                                             </span>
                                         </div>
@@ -633,6 +652,8 @@
                                     <button type="button"
                                             @click="globalSettings.scheduler.chunked_prefill = !globalSettings.scheduler.chunked_prefill"
                                             :class="globalSettings.scheduler.chunked_prefill ? 'bg-black' : 'bg-neutral-200'"
+                                            role="switch"
+                                            :aria-checked="globalSettings.scheduler.chunked_prefill ? 'true' : 'false'"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="globalSettings.scheduler.chunked_prefill ? 'translate-x-5' : 'translate-x-0'"
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -647,6 +668,8 @@
                                     <button type="button"
                                             @click="globalSettings.scheduler.decode_fairness = !globalSettings.scheduler.decode_fairness"
                                             :class="globalSettings.scheduler.decode_fairness ? 'bg-black' : 'bg-neutral-200'"
+                                            role="switch"
+                                            :aria-checked="globalSettings.scheduler.decode_fairness ? 'true' : 'false'"
                                             class="relative w-11 h-6 flex-shrink-0 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="globalSettings.scheduler.decode_fairness ? 'translate-x-5' : 'translate-x-0'"
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -718,6 +741,8 @@
                                     </div>
                                     <button type="button" @click="globalSettings.cache.enabled = !globalSettings.cache.enabled"
                                             :class="globalSettings.cache.enabled ? 'bg-black' : 'bg-neutral-200'"
+                                            role="switch"
+                                            :aria-checked="globalSettings.cache.enabled ? 'true' : 'false'"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="globalSettings.cache.enabled ? 'translate-x-5' : 'translate-x-0'"
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -727,7 +752,7 @@
                                     <div>
                                         <div class="flex items-center gap-2">
                                             <label class="text-sm text-neutral-700">{{ t('settings.cache.hot_cache_only') }}</label>
-                                            <span class="badge bg-amber-50 text-amber-600 border-amber-200">
+                                            <span class="badge bg-amber-50 text-amber-700 border-amber-200">
                                                 {{ t('settings.global.restart_badge') }}
                                             </span>
                                         </div>
@@ -735,14 +760,17 @@
                                     </div>
                                     <button type="button" @click="globalSettings.cache.hot_cache_only = !globalSettings.cache.hot_cache_only"
                                             :class="globalSettings.cache.hot_cache_only ? 'bg-black' : 'bg-neutral-200'"
+                                            role="switch"
+                                            :aria-checked="globalSettings.cache.hot_cache_only ? 'true' : 'false'"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="globalSettings.cache.hot_cache_only ? 'translate-x-5' : 'translate-x-0'"
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                     </button>
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
-                                    <div class="flex items-center gap-2">
+                                    <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.cache.ssd_directory') }}</label>
+                                        <p x-show="globalSettings.cache.ssd_cache_unavailable" x-cloak class="text-xs text-amber-700 mt-1">{{ t('settings.cache.ssd_directory_unavailable') }}</p>
                                     </div>
                                     <input type="text" x-model="globalSettings.cache.ssd_cache_dir"
                                            class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
@@ -850,7 +878,7 @@
                                         <i x-show="settingsCopiedAnchor === 'settings-mcp'" x-cloak data-lucide="check" class="w-3.5 h-3.5"></i>
                                     </button>
                                 </div>
-                                <span class="badge bg-amber-50 text-amber-600 border-amber-200">
+                                <span class="badge bg-amber-50 text-amber-700 border-amber-200">
                                     {{ t('settings.mcp.restart_badge') }}
                                 </span>
                             </div>
@@ -868,6 +896,8 @@
                                     <button type="button"
                                             @click="globalSettings.mcp.expose_tools = !globalSettings.mcp.expose_tools"
                                             :class="globalSettings.mcp.expose_tools ? 'bg-black' : 'bg-neutral-200'"
+                                            role="switch"
+                                            :aria-checked="globalSettings.mcp.expose_tools ? 'true' : 'false'"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="globalSettings.mcp.expose_tools ? 'translate-x-5' : 'translate-x-0'"
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -890,7 +920,7 @@
                                         <i x-show="settingsCopiedAnchor === 'settings-usage'" x-cloak data-lucide="check" class="w-3.5 h-3.5"></i>
                                     </button>
                                 </div>
-                                <span class="badge bg-green-50 text-green-600 border-green-200">
+                                <span class="badge bg-green-50 text-green-700 border-green-200">
                                     {{ t('settings.resource.live_badge') }}
                                 </span>
                             </div>
@@ -927,7 +957,7 @@
                                         <i x-show="settingsCopiedAnchor === 'settings-network'" x-cloak data-lucide="check" class="w-3.5 h-3.5"></i>
                                     </button>
                                 </div>
-                                <span class="badge bg-green-50 text-green-600 border-green-200">
+                                <span class="badge bg-green-50 text-green-700 border-green-200">
                                     {{ t('settings.resource.live_badge') }}
                                 </span>
                             </div>
@@ -978,7 +1008,7 @@
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.section_label') }}</span>
                                 </div>
                                 <div class="flex items-center gap-2">
-                                    <span class="badge bg-amber-50 text-amber-600 border-amber-200">
+                                    <span class="badge bg-amber-50 text-amber-700 border-amber-200">
                                         {{ t('settings.advanced.restart_badge') }}
                                     </span>
                                     <i data-lucide="chevron-down" class="w-4 h-4 text-neutral-400 transition-transform duration-200"
@@ -1003,6 +1033,8 @@
                                             <button type="button"
                                                     @click="globalSettings.server.distributed_inference_enabled = !globalSettings.server.distributed_inference_enabled"
                                                     :class="globalSettings.server.distributed_inference_enabled ? 'bg-black' : 'bg-neutral-200'"
+                                                    role="switch"
+                                                    :aria-checked="globalSettings.server.distributed_inference_enabled ? 'true' : 'false'"
                                                     class="relative w-11 h-6 flex-shrink-0 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                                 <span :class="globalSettings.server.distributed_inference_enabled ? 'translate-x-5' : 'translate-x-0'"
                                                       class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -1039,6 +1071,8 @@
                                             <button type="button"
                                                     @click="globalSettings.server.preserve_mid_system_cache = !globalSettings.server.preserve_mid_system_cache"
                                                     :class="globalSettings.server.preserve_mid_system_cache ? 'bg-black' : 'bg-neutral-200'"
+                                                    role="switch"
+                                                    :aria-checked="globalSettings.server.preserve_mid_system_cache ? 'true' : 'false'"
                                                     class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                                 <span :class="globalSettings.server.preserve_mid_system_cache ? 'translate-x-5' : 'translate-x-0'"
                                                       class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -1070,6 +1104,8 @@
                                             </div>
                                             <button type="button" @click="globalSettings.cache.hot_cache_write_through = !globalSettings.cache.hot_cache_write_through"
                                                     :class="globalSettings.cache.hot_cache_write_through ? 'bg-black' : 'bg-neutral-200'"
+                                                    role="switch"
+                                                    :aria-checked="globalSettings.cache.hot_cache_write_through ? 'true' : 'false'"
                                                     class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                                 <span :class="globalSettings.cache.hot_cache_write_through ? 'translate-x-5' : 'translate-x-0'"
                                                       class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -1082,6 +1118,8 @@
                                             </div>
                                             <button type="button" @click="globalSettings.cache.ane_compile_cache = !globalSettings.cache.ane_compile_cache"
                                                     :class="globalSettings.cache.ane_compile_cache ? 'bg-black' : 'bg-neutral-200'"
+                                                    role="switch"
+                                                    :aria-checked="globalSettings.cache.ane_compile_cache ? 'true' : 'false'"
                                                     class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                                 <span :class="globalSettings.cache.ane_compile_cache ? 'translate-x-5' : 'translate-x-0'"
                                                       class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -1217,7 +1255,7 @@
                             <div x-show="restartServer.message" x-cloak
                                  class="flex items-start gap-2 text-sm min-w-0"
                                  :class="restartServer.status === 'error' ? 'text-red-600'
-                                       : restartServer.status === 'unsupported' ? 'text-amber-600'
+                                       : restartServer.status === 'unsupported' ? 'text-amber-700'
                                        : 'text-neutral-700'"
                                  :title="restartServer.message">
                                 <i x-show="restartServer.status === 'restarting' || restartServer.status === 'waiting'"
@@ -1308,7 +1346,7 @@
                                             <div>
                                                 <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.splash.binary_hint') }}</p>
                                                 <p x-show="!globalSettings.external_engines.splash.available && globalSettings.external_engines.splash.reason"
-                                                   class="text-xs text-amber-600 mt-1 break-words"
+                                                   class="text-xs text-amber-700 mt-1 break-words"
                                                    x-text="globalSettings.external_engines.splash.reason"></p>
                                             </div>
                                         </template>
@@ -1316,7 +1354,7 @@
                                     </div>
                                     <template x-if="globalSettings.external_engines.splash.available && !splashPath.editing">
                                         <div class="flex items-center gap-2 flex-shrink-0">
-                                            <span class="badge bg-green-50 text-green-600 border-green-200"
+                                            <span class="badge bg-green-50 text-green-700 border-green-200"
                                                   x-text="globalSettings.external_engines.splash.label + ' ' + globalSettings.external_engines.splash.version"></span>
                                             <button type="button" @click="editSplashPath()"
                                                     class="px-4 py-2 text-sm font-medium border border-neutral-200 rounded-full hover:bg-neutral-50 transition-colors shrink-0">{{ t('settings.integrations.splash.change') }}</button>
@@ -1373,6 +1411,7 @@
                                     <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.integrations.splash.ssd_cache') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.splash.ssd_cache_hint') }}</p>
+                                        <p class="text-xs text-amber-700 mt-1">{{ t('settings.integrations.splash.ssd_cache_warning') }}</p>
                                     </div>
                                     <div class="flex items-center gap-2">
                                         <input type="number" min="0" step="1"
@@ -1391,6 +1430,8 @@
                                     <button type="button"
                                             @click="globalSettings.integrations.splash_ane_prefill = !globalSettings.integrations.splash_ane_prefill; saveIntegrationSettings()"
                                             :class="globalSettings.integrations.splash_ane_prefill ? 'bg-black' : 'bg-neutral-200'"
+                                            role="switch"
+                                            :aria-checked="globalSettings.integrations.splash_ane_prefill ? 'true' : 'false'"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="globalSettings.integrations.splash_ane_prefill ? 'translate-x-5' : 'translate-x-0'"
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -1481,11 +1522,11 @@
                                         <label class="text-sm text-neutral-700">{{ t('settings.integrations.markitdown.pdf_processing_engine') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.markitdown.pdf_processing_engine_hint') }}</p>
                                         <p x-show="markitdownOcrModelMissing"
-                                           class="text-xs text-amber-600 mt-1">
+                                           class="text-xs text-amber-700 mt-1">
                                             {{ t('settings.integrations.markitdown.pdf_processing_missing_model') }}
                                         </p>
                                         <p x-show="globalSettings.integrations.markitdown_pdf_processing_engine === 'markitdown' || markitdownOcrModelMissing"
-                                           class="text-xs text-amber-600 mt-1">
+                                           class="text-xs text-amber-700 mt-1">
                                             {{ t('settings.integrations.markitdown.pdf_processing_markitdown_warning') }}
                                         </p>
                                     </div>
@@ -1602,6 +1643,8 @@
                                     <button type="button"
                                             @click="globalSettings.integrations.web_search_content_truncate = !globalSettings.integrations.web_search_content_truncate; saveIntegrationSettings()"
                                             :class="globalSettings.integrations.web_search_content_truncate ? 'bg-black' : 'bg-neutral-200'"
+                                            role="switch"
+                                            :aria-checked="globalSettings.integrations.web_search_content_truncate ? 'true' : 'false'"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="globalSettings.integrations.web_search_content_truncate ? 'translate-x-5' : 'translate-x-0'"
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -1770,8 +1813,18 @@
                                             <span x-show="model.settings?.model_alias" x-cloak
                                                   class="badge bg-neutral-100 text-neutral-500 border-neutral-200 truncate max-w-[120px]"
                                                   x-text="model.settings?.model_alias"></span>
+                                            <template x-for="engine in (model.external_engines || []).filter(e => e.compatible)" :key="engine.id">
+                                                <span class="badge bg-neutral-100 text-neutral-600 border-neutral-200"
+                                                      @mouseenter="showTip($event.currentTarget, window.t('settings.models.table.external_engine_tooltip').replace('{engine}', engine.label))"
+                                                      @mouseleave="hideTip()"
+                                                      x-text="engine.label"></span>
+                                            </template>
+                                            <span x-show="model.model_format === 'gguf'" x-cloak
+                                                  class="badge bg-neutral-100 text-neutral-500 border-neutral-200"
+                                                  @mouseenter="showTip($event.currentTarget, window.t('settings.models.table.gguf_tooltip'))"
+                                                  @mouseleave="hideTip()">GGUF</span>
                                             <span x-show="model.is_helper" x-cloak
-                                                  class="badge bg-amber-50 text-amber-600 border-amber-200"
+                                                  class="badge bg-amber-50 text-amber-700 border-amber-200"
                                                   @mouseenter="showTip($event.currentTarget, window.t('settings.models.table.helper_tooltip'))"
                                                   @mouseleave="hideTip()"
                                                   x-text="window.t('settings.models.table.helper_badge')"></span>
@@ -1855,6 +1908,8 @@
                                                     @focus="showTip($event.currentTarget, model.pinned ? window.t('settings.models.table.pin_on_tooltip') : window.t('settings.models.table.pin_off_tooltip'))"
                                                     @blur="hideTip()"
                                                     :class="model.pinned ? 'bg-black' : 'bg-neutral-200'"
+                                                    role="switch"
+                                                    :aria-checked="model.pinned ? 'true' : 'false'"
                                                     class="relative w-11 h-6 flex-shrink-0 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black"
                                                 >
                                                     <span
@@ -1878,6 +1933,8 @@
                                                     @focus="showTip($event.currentTarget, !model.is_hidden ? window.t('settings.models.table.visible_on_tooltip') : window.t('settings.models.table.visible_off_tooltip'))"
                                                     @blur="hideTip()"
                                                     :class="!model.is_hidden ? 'bg-black' : 'bg-neutral-200'"
+                                                    role="switch"
+                                                    :aria-checked="!model.is_hidden ? 'true' : 'false'"
                                                     class="relative w-11 h-6 flex-shrink-0 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black"
                                                 >
                                                     <span
@@ -1958,7 +2015,7 @@
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.max_tokens">
-                                                <span class="badge bg-blue-50 text-blue-700 border-blue-200">
+                                                <span class="badge bg-neutral-100 text-neutral-600 border-neutral-200">
                                                     max_tokens: <span class="ml-1" x-text="model.settings.max_tokens"></span>
                                                 </span>
                                             </template>

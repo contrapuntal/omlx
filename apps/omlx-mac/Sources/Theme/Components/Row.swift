@@ -8,6 +8,7 @@ import SwiftUI
 struct Row<Trailing: View>: View {
     let label: String?
     let sublabel: String?
+    let warning: String?
     let isLast: Bool
     let trailing: Trailing
 
@@ -16,11 +17,13 @@ struct Row<Trailing: View>: View {
     init(
         label: String? = nil,
         sublabel: String? = nil,
+        warning: String? = nil,
         isLast: Bool = false,
         @ViewBuilder trailing: () -> Trailing
     ) {
         self.label = label
         self.sublabel = sublabel
+        self.warning = warning
         self.isLast = isLast
         self.trailing = trailing()
     }
@@ -30,13 +33,19 @@ struct Row<Trailing: View>: View {
             if let label {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(label)
-                        .font(.omlxText(13, weight: .medium))
+                        .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                         .foregroundStyle(theme.text)
                     if let sublabel, !sublabel.isEmpty {
                         Text(sublabel)
                             .font(.omlxText(11.5))
                             .foregroundStyle(theme.textSecondary)
                             .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if let warning, !warning.isEmpty {
+                        Text(warning)
+                            .font(.omlxText(11.5))
+                            .foregroundStyle(theme.warningText)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 }
@@ -82,6 +91,7 @@ extension Row where Trailing == EmptyView {
     init(label: String, sublabel: String? = nil, isLast: Bool = false) {
         self.label = label
         self.sublabel = sublabel
+        self.warning = nil
         self.isLast = isLast
         self.trailing = EmptyView()
     }
@@ -174,10 +184,10 @@ struct LinkRow<Icon: View>: View {
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(label)
-                        .font(.omlxText(13, weight: .medium))
+                        .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                         .foregroundStyle(theme.text)
                     Text(sublabel)
-                        .font(.omlxText(11))
+                        .font(.omlxText(DesignTokens.FontSize.subheadline))
                         .foregroundStyle(theme.textSecondary)
                         .lineLimit(2)
                 }
@@ -242,13 +252,13 @@ struct NavRow<Icon: View>: View {
             HStack(spacing: 10) {
                 icon
                 Text(label)
-                    .font(.omlxText(13, weight: .medium))
+                    .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                     .foregroundStyle(theme.text)
                     .lineLimit(1)
                 Spacer(minLength: 12)
                 if let value, !value.isEmpty {
                     Text(value)
-                        .font(.omlxText(12))
+                        .font(.omlxText(DesignTokens.FontSize.callout))
                         .foregroundStyle(theme.textSecondary)
                         .lineLimit(1)
                         .truncationMode(.tail)

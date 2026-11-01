@@ -24,12 +24,14 @@ from omlx.exceptions import (
     ModelUnavailableError,
 )
 from omlx.model_settings import ModelSettings, ModelSettingsManager
+from omlx.request import TokenLogprob
 from omlx.server import (
     EngineType,
     SamplingDefaults,
     ServerState,
     _format_generation_speed_for_log,
     _reject_diffusion_structured_outputs,
+    _remove_legacy_ced_ssd_cache_for_server,
     _reset_boundary_snapshots_for_server,
     _resolve_metric_durations,
     app,
@@ -75,6 +77,24 @@ class TestBoundarySnapshotLifecycle:
             _reset_boundary_snapshots_for_server()
 
         assert stale_dir.exists()
+
+
+def test_legacy_ced_ssd_cache_is_removed_and_root_kept(tmp_path):
+    root_block = tmp_path / "a" / "root.safetensors"
+    legacy_block = tmp_path / "deepseek_v41_ced_v1" / "a" / "ced.safetensors"
+    for block in (root_block, legacy_block):
+        block.parent.mkdir(parents=True)
+        block.write_text("cache")
+
+    state = ServerState()
+    state.engine_pool = SimpleNamespace(
+        _scheduler_config=SimpleNamespace(paged_ssd_cache_dir=tmp_path)
+    )
+    with patch("omlx.server._server_state", state):
+        _remove_legacy_ced_ssd_cache_for_server()
+
+    assert not (tmp_path / "deepseek_v41_ced_v1").exists()
+    assert root_block.exists()
 
 
 @pytest.mark.asyncio
@@ -1175,10 +1195,11 @@ class TestExposedProfileModels:
 
         response = await server_module.list_models(True)
 
-        model_ids = {model.id for model in response.data}
+        data = json.loads(bytes(response.body))["data"]
+        model_ids = {model["id"] for model in data}
         assert "qwen-base:thinking" in model_ids
-        profile_model = next(m for m in response.data if m.id == "qwen-base:thinking")
-        assert profile_model.max_model_len == 4096
+        profile_model = next(m for m in data if m["id"] == "qwen-base:thinking")
+        assert profile_model["max_model_len"] == 4096
 
     @pytest.mark.asyncio
     async def test_v1_models_status_includes_exposed_profile_capabilities(
@@ -1226,12 +1247,13 @@ class TestExposedProfileModels:
 
         response = await server_module.list_models(True)
 
-        model_ids = {model.id for model in response.data}
+        data = json.loads(bytes(response.body))["data"]
+        model_ids = {model["id"] for model in data}
         assert "gpt-4" in model_ids
         assert "gpt-4:thinking" in model_ids
         assert "qwen-base:thinking" not in model_ids
-        profile_model = next(m for m in response.data if m.id == "gpt-4:thinking")
-        assert profile_model.max_model_len == 4096
+        profile_model = next(m for m in data if m["id"] == "gpt-4:thinking")
+        assert profile_model["max_model_len"] == 4096
 
     def test_sampling_params_use_exposed_profile_settings(self, manager):
         """Runtime settings come from the requested profile model, not its source."""
@@ -1300,6 +1322,38 @@ class TestExposedProfileModels:
 
         assert budget == 512
 
+    def test_gpu_power_limit_takes_lower_of_request_and_settings(self, manager):
+        pool = srv.EnginePool()
+        pool._entries["qwen-base"] = object()
+        manager.set_settings("qwen-base", ModelSettings(gpu_power_limit_w=30))
+        self._save_exposed_profile(manager, {"gpu_power_limit_w": 20})
+        srv._server_state.engine_pool = pool
+        resolve = srv._resolve_gpu_power_limit
+
+        assert resolve(object(), "qwen-base") == 30
+        assert resolve(object(), "qwen-base:thinking") == 20
+        assert resolve(SimpleNamespace(gpu_power_limit_w=10), "qwen-base") == 10
+        assert resolve(SimpleNamespace(gpu_power_limit_w=25), "qwen-base") == 25
+        assert resolve(SimpleNamespace(gpu_power_limit_w=40), "qwen-base") == 30
+        # Responses requests pass extra fields through unvalidated.
+        for raw in (True, 1, "10", 7.5):
+            assert resolve(SimpleNamespace(gpu_power_limit_w=raw), "qwen-base") == 30
+
+    @pytest.mark.asyncio
+    async def test_lease_acquires_and_releases_gpu_power_once(self, monkeypatch):
+        limiter = MagicMock()
+        monkeypatch.setattr(srv._server_state, "gpu_power_limiter", limiter)
+        lease = srv._LLMEngineLease()
+
+        lease.limit_gpu_power(None)
+        lease.limit_gpu_power(10)
+        lease.limit_gpu_power(5)
+        await lease.release()
+        await lease.release()
+
+        limiter.acquire.assert_called_once_with(10)
+        limiter.release.assert_called_once_with(10)
+
     def test_max_context_window_uses_exposed_profile_settings(self, manager):
         import omlx.server as server_module
         from omlx.engine_pool import EnginePool
@@ -1313,6 +1367,70 @@ class TestExposedProfileModels:
         max_context = get_max_context_window("qwen-base:thinking")
 
         assert max_context == 4096
+
+
+class TestClaudeDesktopTierAliases:
+    """Claude Desktop tier slots in /v1/models and request model resolution."""
+
+    class _FakePool:
+        def __init__(self, model_ids):
+            self._model_ids = model_ids
+
+        def get_status(self):
+            return {
+                "models": [
+                    {"id": mid, "loaded": False, "pinned": False, "model_type": "llm"}
+                    for mid in self._model_ids
+                ]
+            }
+
+        def resolve_model_id(
+            self, model_id, settings_manager=None, claude_tier_aliases=None
+        ):
+            return (claude_tier_aliases or {}).get(model_id, model_id)
+
+        def get_entry(self, model_id):
+            return None
+
+    @pytest.fixture
+    def state(self, tmp_path):
+        state = srv._server_state
+        saved = (state.engine_pool, state.settings_manager, state.global_settings)
+        gs = GlobalSettings(base_path=tmp_path)
+        gs.claude_code.opus_model = "opus-phys"
+        gs.claude_code.sonnet_model = "sonnet-phys"
+        gs.claude_code.haiku_model = "missing-phys"
+        state.global_settings = gs
+        state.settings_manager = ModelSettingsManager(tmp_path)
+        # A real model owns the sonnet slot id.
+        state.engine_pool = self._FakePool(
+            ["opus-phys", "sonnet-phys", "claude-sonnet"]
+        )
+        try:
+            yield state
+        finally:
+            state.engine_pool, state.settings_manager, state.global_settings = saved
+
+    @staticmethod
+    async def _listed():
+        response = await srv.list_models(True)
+        return {m["id"]: m for m in json.loads(bytes(response.body))["data"]}
+
+    @pytest.mark.asyncio
+    async def test_slots_follow_desktop_toggle(self, state):
+        models = await self._listed()
+        assert "claude-opus" not in models
+        assert "display_name" not in models["opus-phys"]
+        assert srv.resolve_model_id("claude-opus") == "claude-opus"
+
+        state.global_settings.claude_code.desktop_enabled = True
+        models = await self._listed()
+
+        assert models["claude-opus"]["display_name"] == "opus-phys"
+        assert models["claude-opus"]["anthropic_family_tier"] == "opus"
+        assert "display_name" not in models["claude-sonnet"]
+        assert "claude-haiku" not in models
+        assert srv.resolve_model_id("claude-opus") == "opus-phys"
 
 
 class TestHealthPreloadReadiness:
@@ -1426,6 +1544,32 @@ def test_responses_reasoning_cache_policy(
 def test_anthropic_adaptive_thinking_reaches_minimax_m3_template(
     monkeypatch, model_type, thinking_type, expected
 ):
+    kwargs = _anthropic_preflight_kwargs(
+        monkeypatch,
+        {
+            "messages": [{"role": "user", "content": "Hello"}],
+            "thinking": {"type": thinking_type},
+        },
+        model_type=model_type,
+    )
+    assert kwargs["chat_template_kwargs"] == expected
+
+
+def test_anthropic_auto_mode_classifier_gets_thinking_budget(monkeypatch):
+    body = {
+        "system": "You are a security monitor for autonomous AI coding agents.",
+        "messages": [{"role": "user", "content": "<transcript>ls</transcript>"}],
+    }
+    kwargs = _anthropic_preflight_kwargs(monkeypatch, body)
+    assert kwargs["thinking_budget"] == 256
+    assert "enable_thinking" not in (kwargs.get("chat_template_kwargs") or {})
+
+    kwargs = _anthropic_preflight_kwargs(monkeypatch, {**body, "stream": True})
+    assert "thinking_budget" not in kwargs
+
+
+def _anthropic_preflight_kwargs(monkeypatch, body, model_type="qwen3_5"):
+    """Return the kwargs /v1/messages hands to engine.preflight_chat."""
     engine = MagicMock()
     engine.model_type = model_type
     engine.is_diffusion_model = False
@@ -1452,16 +1596,10 @@ def test_anthropic_adaptive_thinking_reaches_minimax_m3_template(
     )
     with TestClient(srv.app, raise_server_exceptions=False) as client:
         response = client.post(
-            "/v1/messages",
-            json={
-                "model": "test-model",
-                "max_tokens": 64,
-                "messages": [{"role": "user", "content": "Hello"}],
-                "thinking": {"type": thinking_type},
-            },
+            "/v1/messages", json={"model": "test-model", "max_tokens": 64, **body}
         )
     assert response.status_code == 418, response.text
-    assert engine.preflight_chat.call_args.kwargs["chat_template_kwargs"] == expected
+    return engine.preflight_chat.call_args.kwargs
 
 
 class TestRequestBodySizeLimit:
@@ -1533,6 +1671,83 @@ def prepared_chat_engine():
     engine.start = AsyncMock()
     engine.supports_request_scoped_abort = False
     return engine
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_chat_completion_returns_token_logprobs(
+    monkeypatch, prepared_chat_engine, stream
+):
+    def entry(text):
+        alt = TokenLogprob(token_id=9, text="x", token_bytes=[120], logprob=-3.0)
+        return TokenLogprob(1, text, list(text.encode()), -0.5, top=[alt])
+
+    # The last token adds no text, so its logprob rides on the finish chunk.
+    chunks = [("Hel", [entry("Hel")]), ("lo", [entry("lo")]), ("", [entry("<e>")])]
+    engine = prepared_chat_engine
+    engine.preflight_chat = AsyncMock()
+    engine.chat = AsyncMock(
+        return_value=GenerationOutput(
+            text="Hello", logprobs=[e for _, lps in chunks for e in lps]
+        )
+    )
+    streamed_kwargs = []
+
+    async def stream_chat(**kwargs):
+        streamed_kwargs.append(kwargs)
+        for i, (text, lps) in enumerate(chunks):
+            done = i == len(chunks) - 1
+            yield GenerationOutput(
+                text=text, new_text=text, logprobs=lps, finished=done
+            )
+
+    engine.stream_chat = stream_chat
+    pool = MagicMock()
+    pool.preload_pinned_models = AsyncMock()
+    pool.check_ttl_expirations = AsyncMock()
+    pool.shutdown = AsyncMock()
+    pool.get_entry.return_value = None
+    state = ServerState()
+    state.engine_pool = pool
+    monkeypatch.setattr(srv, "_server_state", state)
+    monkeypatch.setattr(srv, "get_engine_for_model", AsyncMock(return_value=engine))
+    monkeypatch.setattr(srv, "resolve_model_id", lambda name: name)
+    monkeypatch.setattr(srv, "get_model_settings_for_request", lambda name: None)
+    monkeypatch.setattr(srv, "validate_context_window", MagicMock())
+    monkeypatch.setitem(
+        srv.app.dependency_overrides, srv.verify_inference_api_key, lambda: True
+    )
+    body = {
+        "model": "test-model",
+        "stream": stream,
+        "messages": [{"role": "user", "content": "Hi"}],
+        "logprobs": True,
+        "top_logprobs": 1,
+    }
+
+    with TestClient(srv.app, raise_server_exceptions=False) as client:
+        response = client.post("/v1/chat/completions", json=body)
+
+    assert response.status_code == 200, response.text
+    generated = streamed_kwargs[0] if stream else engine.chat.call_args.kwargs
+    assert (generated["logprobs"], generated["top_logprobs"]) == (True, 1)
+    if stream:
+        choices = [
+            json.loads(line.removeprefix("data: "))["choices"][0]
+            for line in response.text.splitlines()
+            if line.startswith("data: {")
+        ]
+        content = [
+            lp for c in choices for lp in (c.get("logprobs") or {}).get("content", [])
+        ]
+        assert choices[-1]["finish_reason"] == "stop"
+        assert choices[-1]["logprobs"]["content"][0]["token"] == "<e>"
+    else:
+        content = response.json()["choices"][0]["logprobs"]["content"]
+    assert [lp["token"] for lp in content] == ["Hel", "lo", "<e>"]
+    assert content[0]["bytes"] == list(b"Hel")
+    assert content[0]["top_logprobs"] == [
+        {"token": "x", "logprob": -3.0, "bytes": [120]}
+    ]
 
 
 @pytest.mark.parametrize("subclass", [False, True])
@@ -1621,6 +1836,7 @@ def test_chat_routes_reuse_final_prepared_prompt(
     assert prepared == ("canonical prompt", [11, 12, 13])
     generated = streamed_kwargs[0] if stream else engine.chat.call_args.kwargs
     assert generated["_prepared_prompt"] is prepared
+    assert generated["_request_id"] == response.headers["x-omlx-request-id"]
     assert generated["chat_template_kwargs"]["preserve_thinking"] is True
     if path == "/v1/messages" and stream:
         events = [
@@ -1630,3 +1846,57 @@ def test_chat_routes_reuse_final_prepared_prompt(
         ]
         start = next(event for event in events if event["type"] == "message_start")
         assert start["message"]["usage"]["input_tokens"] == len(prepared[1])
+
+
+@pytest.mark.parametrize("ignore_eos", [None, True])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/completions"])
+def test_ignore_eos_reaches_the_engine(
+    monkeypatch, prepared_chat_engine, path, stream, ignore_eos
+):
+    chat = path == "/v1/chat/completions"
+    engine = prepared_chat_engine
+    output = GenerationOutput(text="Hello", finished=True, finish_reason="length")
+    engine.preflight_chat = AsyncMock()
+    engine.chat = AsyncMock(return_value=output)
+    engine.generate = AsyncMock(return_value=output)
+    streamed_kwargs = []
+
+    async def streamed(**kwargs):
+        streamed_kwargs.append(kwargs)
+        yield output
+
+    engine.stream_chat = streamed
+    engine.stream_generate = streamed
+    pool = MagicMock()
+    pool.preload_pinned_models = AsyncMock()
+    pool.check_ttl_expirations = AsyncMock()
+    pool.shutdown = AsyncMock()
+    pool.get_entry.return_value = None
+    state = ServerState()
+    state.engine_pool = pool
+    monkeypatch.setattr(srv, "_server_state", state)
+    monkeypatch.setattr(srv, "get_engine_for_model", AsyncMock(return_value=engine))
+    monkeypatch.setattr(srv, "resolve_model_id", lambda name: name)
+    monkeypatch.setattr(srv, "get_model_settings_for_request", lambda name: None)
+    monkeypatch.setattr(srv, "validate_context_window", MagicMock())
+    monkeypatch.setitem(
+        srv.app.dependency_overrides, srv.verify_inference_api_key, lambda: True
+    )
+    body = {"model": "test-model", "stream": stream, "max_tokens": 16}
+    if chat:
+        body["messages"] = [{"role": "user", "content": "Hello"}]
+    else:
+        body["prompt"] = "Hello"
+    if ignore_eos is not None:
+        body["ignore_eos"] = ignore_eos
+
+    with TestClient(srv.app, raise_server_exceptions=False) as client:
+        response = client.post(path, json=body)
+
+    assert response.status_code == 200, response.text
+    if stream:
+        generated = streamed_kwargs[0]
+    else:
+        generated = (engine.chat if chat else engine.generate).call_args.kwargs
+    assert generated.get("ignore_eos", False) is bool(ignore_eos)

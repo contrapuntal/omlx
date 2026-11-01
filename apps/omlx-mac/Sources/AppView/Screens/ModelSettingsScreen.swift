@@ -117,7 +117,7 @@ private struct Header: View {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {
                     Text(model?.displayTitle ?? "—")
-                        .font(.omlxText(17, weight: .semibold))
+                        .font(.omlxText(DesignTokens.FontSize.title2, weight: .semibold))
                         .foregroundStyle(theme.text)
                         .lineLimit(1)
                         .truncationMode(.tail)
@@ -127,7 +127,7 @@ private struct Header: View {
                 }
                 if let m = model {
                     Text("\(m.id) · \(m.estimatedSizeFormatted ?? formatBytes(m.estimatedSize))")
-                        .font(.omlxMono(11))
+                        .font(.omlxMono(DesignTokens.FontSize.subheadline))
                         .foregroundStyle(theme.textSecondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -271,7 +271,7 @@ private struct SettingsApplySheet: View {
     private var errorLine: some View {
         if let error = vm.applyError {
             Text(error)
-                .font(.omlxText(12))
+                .font(.omlxText(DesignTokens.FontSize.callout))
                 .foregroundStyle(theme.redDot)
                 .textSelection(.enabled)
         }
@@ -282,19 +282,19 @@ private struct SettingsApplySheet: View {
             Text(String(localized: "settings.apply.recipe.title",
                         defaultValue: "Apply custom recipe",
                         comment: "Title of the paste-a-recipe sheet"))
-                .font(.omlxText(17, weight: .semibold))
+                .font(.omlxText(DesignTokens.FontSize.title2, weight: .semibold))
                 .foregroundStyle(theme.text)
             Text(String(localized: "settings.apply.recipe.hint",
                         defaultValue: "Paste a recipe copied from the Recipe row of a benchmark detail page on omlx.ai.",
                         comment: "Hint explaining where a settings recipe can be copied from"))
-                .font(.omlxText(12))
+                .font(.omlxText(DesignTokens.FontSize.callout))
                 .foregroundStyle(theme.textSecondary)
             linkButton(Self.benchmarksURL,
                        title: String(localized: "settings.apply.result.open_search",
                                      defaultValue: "Open community benchmarks",
                                      comment: "Link button that opens the omlx.ai performance leaderboard"))
             TextEditor(text: $recipeText)
-                .font(.omlxMono(11))
+                .font(.omlxMono(DesignTokens.FontSize.subheadline))
                 .scrollContentBackground(.hidden)
                 .frame(height: 110)
                 .padding(6)
@@ -310,7 +310,7 @@ private struct SettingsApplySheet: View {
                     Text(String(localized: "settings.apply.recipe.applying",
                                 defaultValue: "Applying the recipe...",
                                 comment: "Progress text while a pasted recipe is being applied"))
-                        .font(.omlxText(12))
+                        .font(.omlxText(DesignTokens.FontSize.callout))
                         .foregroundStyle(theme.textSecondary)
                 }
                 Spacer()
@@ -337,14 +337,14 @@ private struct SettingsApplySheet: View {
             Text(String(localized: "settings.apply.result.title_optimal",
                         defaultValue: "Optimal settings from omlx.ai",
                         comment: "Title of the optimal-settings sheet"))
-                .font(.omlxText(17, weight: .semibold))
+                .font(.omlxText(DesignTokens.FontSize.title2, weight: .semibold))
                 .foregroundStyle(theme.text)
             if let candidates {
                 if candidates.found {
                     Text(String(localized: "settings.apply.choose.hint",
                                 defaultValue: "Pick a benchmark result to apply its settings. Rows are the best matches for this chip and model with the same or less memory, at a 4k prompt.",
                                 comment: "Hint above the benchmark candidate list"))
-                        .font(.omlxText(12))
+                        .font(.omlxText(DesignTokens.FontSize.callout))
                         .foregroundStyle(theme.textSecondary)
                     ScrollView {
                         VStack(alignment: .leading, spacing: 12) {
@@ -367,7 +367,7 @@ private struct SettingsApplySheet: View {
                 errorLine
             } else if let error = vm.applyError {
                 Text(error)
-                    .font(.omlxText(12))
+                    .font(.omlxText(DesignTokens.FontSize.callout))
                     .foregroundStyle(theme.redDot)
                     .textSelection(.enabled)
             } else {
@@ -376,7 +376,7 @@ private struct SettingsApplySheet: View {
                     Text(String(localized: "settings.apply.optimal.loading",
                                 defaultValue: "Fetching the best benchmark results from omlx.ai...",
                                 comment: "Progress text while omlx.ai candidates are fetched"))
-                        .font(.omlxText(12))
+                        .font(.omlxText(DesignTokens.FontSize.callout))
                         .foregroundStyle(theme.textSecondary)
                 }
                 .padding(.vertical, 12)
@@ -387,7 +387,7 @@ private struct SettingsApplySheet: View {
                     Text(String(localized: "settings.apply.optimal.applying",
                                 defaultValue: "Applying the benchmark settings...",
                                 comment: "Progress text while a chosen benchmark snapshot is applied"))
-                        .font(.omlxText(12))
+                        .font(.omlxText(DesignTokens.FontSize.callout))
                         .foregroundStyle(theme.textSecondary)
                 }
                 Spacer()
@@ -401,7 +401,7 @@ private struct SettingsApplySheet: View {
         if !rows.isEmpty {
             VStack(alignment: .leading, spacing: 6) {
                 Text(label)
-                    .font(.omlxText(11, weight: .semibold))
+                    .font(.omlxText(DesignTokens.FontSize.subheadline, weight: .semibold))
                     .foregroundStyle(theme.textSecondary)
                 ForEach(rows) { row in
                     HStack(alignment: .center, spacing: 10) {
@@ -410,13 +410,13 @@ private struct SettingsApplySheet: View {
                                 linkButton(url, title: urlText)
                             } else {
                                 Text(row.benchmarkId)
-                                    .font(.omlxMono(11))
+                                    .font(.omlxMono(DesignTokens.FontSize.subheadline))
                                     .foregroundStyle(theme.text)
                             }
                             Text(ModelSettingsScreenVM.candidateStats(
                                 pp: row.ppTps, tg: row.tgTps, memoryGb: row.memoryGb,
                                 quantization: row.quantization, omlxVersion: row.omlxVersion))
-                                .font(.omlxMono(11))
+                                .font(.omlxMono(DesignTokens.FontSize.subheadline))
                                 .foregroundStyle(theme.textSecondary)
                         }
                         Spacer()
@@ -446,12 +446,12 @@ private struct SettingsApplySheet: View {
         Text(String(localized: "settings.apply.result.none_title",
                     defaultValue: "No benchmark result matches this device and model.",
                     comment: "Headline when omlx.ai has no benchmark for the current device and model"))
-            .font(.omlxText(13, weight: .medium))
+            .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
             .foregroundStyle(theme.text)
         Text(String(localized: "settings.apply.result.none_body",
                     defaultValue: "Find a similar model on the community benchmarks and apply its recipe with Apply custom recipe.",
                     comment: "Guidance shown when no matching benchmark exists"))
-            .font(.omlxText(12))
+            .font(.omlxText(DesignTokens.FontSize.callout))
             .foregroundStyle(theme.textSecondary)
         linkButton(URL(string: searchUrl ?? "") ?? Self.benchmarksURL,
                    title: String(localized: "settings.apply.result.open_search",
@@ -469,7 +469,7 @@ private struct SettingsApplySheet: View {
                  : String(localized: "settings.apply.result.title_optimal",
                           defaultValue: "Optimal settings from omlx.ai",
                           comment: "Title of the optimal-settings sheet"))
-                .font(.omlxText(17, weight: .semibold))
+                .font(.omlxText(DesignTokens.FontSize.title2, weight: .semibold))
                 .foregroundStyle(theme.text)
             Text(result.changed == false
                  ? String(localized: "settings.apply.result.no_change",
@@ -482,14 +482,14 @@ private struct SettingsApplySheet: View {
                     : String(localized: "settings.apply.result.done_optimal",
                              defaultValue: "The settings below were applied from the selected benchmark!",
                              comment: "Result line after a chosen benchmark snapshot was applied")))
-                .font(.omlxText(13, weight: .medium))
+                .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                 .foregroundStyle(theme.text)
             if let urlText = result.benchmarkUrl, let url = URL(string: urlText) {
                 linkButton(url, title: urlText)
                 Text(ModelSettingsScreenVM.candidateStats(
                     pp: result.ppTps, tg: result.tgTps,
                     quantization: result.quantization, omlxVersion: result.omlxVersion))
-                    .font(.omlxMono(11))
+                    .font(.omlxMono(DesignTokens.FontSize.subheadline))
                     .foregroundStyle(theme.textSecondary)
             }
             let skipped = ModelSettingsScreenVM.summarizeSkipped(result.skipped)
@@ -498,11 +498,11 @@ private struct SettingsApplySheet: View {
                     Text(String(localized: "settings.apply.result.skipped",
                                 defaultValue: "Skipped on this machine",
                                 comment: "Label above the list of features the server dropped while applying a snapshot"))
-                        .font(.omlxText(12, weight: .semibold))
+                        .font(.omlxText(DesignTokens.FontSize.callout, weight: .semibold))
                         .foregroundStyle(theme.warningText)
                     ForEach(skipped, id: \.self) { line in
                         Text(line)
-                            .font(.omlxText(12))
+                            .font(.omlxText(DesignTokens.FontSize.callout))
                             .foregroundStyle(theme.warningText)
                     }
                 }
@@ -514,11 +514,11 @@ private struct SettingsApplySheet: View {
             Text(String(localized: "settings.apply.result.applied",
                         defaultValue: "Applied settings",
                         comment: "Label above the JSON of the applied settings"))
-                .font(.omlxText(11, weight: .medium))
+                .font(.omlxText(DesignTokens.FontSize.subheadline, weight: .medium))
                 .foregroundStyle(theme.textSecondary)
             ScrollView {
                 Text(ModelSettingsScreenVM.appliedJSON(result.applied))
-                    .font(.omlxMono(11))
+                    .font(.omlxMono(DesignTokens.FontSize.subheadline))
                     .foregroundStyle(theme.text)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -531,7 +531,7 @@ private struct SettingsApplySheet: View {
                 Text(String(localized: "settings.apply.result.reload_note",
                             defaultValue: "The model will use the new settings after its next load.",
                             comment: "Note shown when applied settings only take effect at model load"))
-                    .font(.omlxText(12))
+                    .font(.omlxText(DesignTokens.FontSize.callout))
                     .foregroundStyle(theme.textSecondary)
             }
             HStack {
@@ -958,7 +958,7 @@ private struct TopPage: View {
         return NavRow(label: page.title,
                       value: vm.summary(for: page),
                       isLast: isLast,
-                      isDimmed: enginePage && !vm.externalEngine.isEmpty,
+                      isDimmed: enginePage && !vm.effectiveExternalEngine.isEmpty,
                       action: { open(page) }) {
             Squircle(systemSymbol: symbol, gradient: gradient)
         }
@@ -975,7 +975,8 @@ private struct BasicSection: View {
                              comment: "Section header above the Basic tab fields"))
 
         // These are per-model fields (never stored in profiles), so each
-        // one saves on commit. Enable Thinking is the profile exception.
+        // one saves on commit. Context Window and Enable Thinking are the
+        // profile exceptions.
         ListGroup {
             Row(label: String(localized: "settings.basic.alias.label",
                               defaultValue: "Model Alias",
@@ -986,14 +987,31 @@ private struct BasicSection: View {
                 TextInput(text: $vm.alias, placeholder: vm.modelID, mono: true, width: .controlMedium)
                     .onSubmit { Task { await vm.save(.alias, client: client) } }
             }
-            Row(label: String(localized: "settings.basic.model_type.label",
-                              defaultValue: "Model Type",
-                              comment: "Row label for the model type override popup")) {
-                Popup(
-                    selection: vm.bind($vm.modelTypeOverride, save: { Task { await vm.save(.modelType, client: client) } }),
-                    width: .controlMedium,
-                    options: ModelSettingsScreenVM.modelTypeOptions
-                )
+            // A GGUF's type comes from its file.
+            if vm.model?.isGGUF != true {
+                Row(label: String(localized: "settings.basic.model_type.label",
+                                  defaultValue: "Model Type",
+                                  comment: "Row label for the model type override popup")) {
+                    Popup(
+                        selection: vm.bind($vm.modelTypeOverride, save: { Task { await vm.save(.modelType, client: client) } }),
+                        width: .controlMedium,
+                        options: ModelSettingsScreenVM.modelTypeOptions
+                    )
+                }
+            }
+            if vm.showsEmbeddingContextWindow || vm.showsRerankerContextWindow {
+                Row(label: String(localized: "settings.basic.context_window.label",
+                                  defaultValue: "Context Window",
+                                  comment: "Row label for the context window field"),
+                    sublabel: vm.showsRerankerContextWindow
+                        ? String(localized: "settings.basic.reranker_context_window.sub",
+                                 defaultValue: "Used when a request does not set max_length. Jina rerankers read documents together up to this many tokens, other rerankers cut each query-document pair to this length.",
+                                 comment: "Sublabel for the context window field of a reranker model")
+                        : String(localized: "settings.basic.embedding_context_window.sub",
+                                 defaultValue: "Longer inputs are truncated to this length when a request does not set max_length.",
+                                 comment: "Sublabel for the context window field of an embedding model")) {
+                    TextInput(text: vm.bindProfile($vm.contextLength), mono: true, suffix: "tk", width: .controlCompact)
+                }
             }
             Row(label: String(localized: "settings.basic.ttl.label",
                               defaultValue: "TTL",
@@ -1122,7 +1140,7 @@ private struct GenerationSection: View {
                                   defaultValue: "Top K",
                                   comment: "Row label for the top-k sampling field"),
                     sublabel: String(localized: "settings.basic.top_k.sub",
-                                     defaultValue: "Limit candidates to top K (positive integer).",
+                                     defaultValue: "Limit candidates to top K (0 turns it off).",
                                      comment: "Sublabel describing the top-k field")) {
                     TextInput(text: vm.bindProfile($vm.topK), mono: true, width: .controlNarrow)
                 }
@@ -1200,11 +1218,24 @@ private struct AdvancedPage: View {
                 sublabel: String(localized: "settings.advanced.trust_remote_code.sub",
                                  defaultValue: "Execute HuggingFace custom model code. Only enable for models you trust. Per-model only — never inherited from profiles.",
                                  comment: "Sublabel describing the security implications of trust-remote-code"),
-                isLast: !showsLLMRows) {
+                isLast: !vm.isLLMLike) {
                 RowSwitch(isOn: vm.bind($vm.trustRemoteCode, save: {
                     Task { await vm.save(.trustRemoteCode, client: client) }
                 }))
                 .tint(theme.redDot)
+            }
+            if showsLLMRows && vm.model?.activationFp16Supported == true {
+                Row(label: String(localized: "settings.advanced.activation_fp16.label",
+                                  defaultValue: "Float16 Activations",
+                                  comment: "Row label for the load-time bfloat16 to float16 recast toggle"),
+                    sublabel: vm.activationFp16ConflictReason ?? String(localized: "settings.advanced.activation_fp16.sub",
+                                     defaultValue: "Converts the bfloat16 scales, norms and embeddings of this model to float16 at load. M1 and M2 GPUs emulate bfloat16, so prefill and decode run faster. Output can differ slightly from bfloat16.",
+                                     comment: "Sublabel for the load-time bfloat16 to float16 recast toggle")) {
+                    RowSwitch(isOn: vm.bind($vm.activationFp16Enabled, save: {
+                        Task { await vm.save(.activationFp16, client: client) }
+                    }))
+                    .disabled(vm.activationFp16ConflictReason != nil && !vm.activationFp16Enabled)
+                }
             }
             if showsLLMRows {
                 Row(label: String(localized: "settings.advanced.thinking_budget.label",
@@ -1221,6 +1252,33 @@ private struct AdvancedPage: View {
                         RowSwitch(isOn: vm.bindProfile($vm.thinkingBudgetEnabled))
                     }
                 }
+            }
+            // The cap applies to every generating engine, diffusion included.
+            if vm.isLLMLike {
+                Row(label: String(localized: "settings.advanced.gpu_power_limit.label",
+                                  defaultValue: "GPU Power Limit",
+                                  comment: "Row label for the per-model GPU power limit"),
+                    sublabel: vm.gpuPowerLimitSupported
+                        ? String(localized: "settings.advanced.gpu_power_limit.sub",
+                                 defaultValue: "Caps GPU power for the whole Mac while this model generates, from 2 to 1000 W. It only helps below the usual draw. For example, an M5 Max uses about 25 W to generate an answer: 10 W saves about 40% energy per token and 5 W about half.",
+                                 comment: "Sublabel for the per-model GPU power limit")
+                        : GPUPowerGuide.unsupportedText,
+                    isLast: !showsLLMRows) {
+                    HStack(spacing: 8) {
+                        if vm.limitGpuPower {
+                            TextInput(text: vm.bindProfile($vm.gpuPowerLimitWatts),
+                                      placeholder: "2-1000", mono: true, isNumeric: true,
+                                      range: 2...1000, step: 1, suffix: "W",
+                                      width: .controlCompact)
+                        }
+                        GPUPowerGuideButton()
+                        // Unsupported GPUs can still turn an existing limit off.
+                        RowSwitch(isOn: vm.bindProfile($vm.limitGpuPower))
+                            .disabled(!vm.gpuPowerLimitSupported && !vm.limitGpuPower)
+                    }
+                }
+            }
+            if showsLLMRows {
                 Row(label: String(localized: "settings.advanced.tool_result_limit.label",
                                   defaultValue: "Limit Tool Result Tokens",
                                   comment: "Row label for the tool-result token limit field"),
@@ -1327,7 +1385,7 @@ private struct GrammarEditor: View {
 
     var body: some View {
         TextEditor(text: $text)
-            .font(.omlxMono(11))
+            .font(.omlxMono(DesignTokens.FontSize.subheadline))
             .scrollContentBackground(.hidden)
             .frame(height: 96)
             .padding(6)
@@ -1335,7 +1393,7 @@ private struct GrammarEditor: View {
             .overlay(alignment: .topLeading) {
                 if text.isEmpty {
                     Text(verbatim: #"root ::= "YES""#)
-                        .font(.omlxMono(11))
+                        .font(.omlxMono(DesignTokens.FontSize.subheadline))
                         .foregroundStyle(theme.textTertiary)
                         .padding(.horizontal, 11)
                         .padding(.vertical, 6)
@@ -1359,7 +1417,7 @@ private struct EnginePage<Content: View>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if !vm.externalEngine.isEmpty {
+            if !vm.effectiveExternalEngine.isEmpty {
                 HintLine(text: String(localized: "settings.advanced.external_engine.section_note",
                                       defaultValue: "These settings do not apply while an external engine serves this model.",
                                       comment: "Note above MLX-only settings while an external engine serves the model"),
@@ -1368,7 +1426,7 @@ private struct EnginePage<Content: View>: View {
                     .padding(.bottom, 8)
             }
             content()
-                .disabled(!vm.externalEngine.isEmpty)
+                .disabled(!vm.effectiveExternalEngine.isEmpty)
         }
         .padding(.top, 14)
     }
@@ -1430,10 +1488,17 @@ private struct MemorySavingSection: View {
                 HStack(spacing: 8) {
                     if vm.turboquantKvEnabled {
                         Popup(
-                            selection: vm.bindProfile($vm.turboquantKvBits),
-                            width: .controlCompact,
-                            options: ModelSettingsScreenVM.turboquantKvBitsOptions
+                            selection: vm.bindProfile($vm.turboquantKvScheme),
+                            width: .controlMedium,
+                            options: ModelSettingsScreenVM.turboquantKvSchemeOptions
                         )
+                        if vm.turboquantKvScheme == "turboquant" {
+                            Popup(
+                                selection: vm.bindProfile($vm.turboquantKvBits),
+                                width: .controlCompact,
+                                options: ModelSettingsScreenVM.turboquantKvBitsOptions
+                            )
+                        }
                     }
                     RowSwitch(isOn: vm.bindProfile($vm.turboquantKvEnabled))
                         .disabled(vm.vlmMtpEnabled)
@@ -1474,18 +1539,35 @@ private struct ExternalEngineRow: View {
     @Bindable var vm: ModelSettingsScreenVM
     let client: OMLXClient
     let engines: [ExternalEngineOption]
+    @State private var draftStarted = false
+    /// Why the last draft download did not start; the button retries.
+    @State private var draftError: String?
 
     private var usableEngine: String? {
         engines.first(where: { $0.compatible })?.id
     }
 
+    private var isGGUF: Bool { vm.model?.isGGUF == true }
+
+    private var draftRepo: String? {
+        let engine = engines.first(where: { $0.id == vm.effectiveExternalEngine }) ?? engines.first
+        guard let engine, !engine.compatible else { return nil }
+        return engine.draftRepo
+    }
+
     private var sublabel: String {
-        let selected = engines.first(where: { $0.id == vm.externalEngine })
+        if let draftError { return draftError }
+        let selected = engines.first(where: { $0.id == vm.effectiveExternalEngine })
         if let selected, !selected.compatible, let reason = selected.reason, !reason.isEmpty {
             return reason
         }
         if usableEngine == nil, let reason = engines.first?.reason, !reason.isEmpty {
             return reason
+        }
+        if isGGUF {
+            return String(localized: "settings.advanced.external_engine.gguf",
+                          defaultValue: "GGUF models run on an external engine only.",
+                          comment: "Sublabel for the external engine toggle of a GGUF model")
         }
         return String(localized: "settings.advanced.external_engine.sub",
                       defaultValue: "Serve this model with another inference engine in its own process instead of oMLX's MLX engines.",
@@ -1498,6 +1580,20 @@ private struct ExternalEngineRow: View {
                           comment: "Row label for serving a model with an external engine"),
             sublabel: sublabel) {
             HStack(spacing: 7) {
+                if let draftRepo {
+                    Button(draftStarted
+                           ? String(localized: "settings.advanced.external_engine.draft_started",
+                                    defaultValue: "Downloading…",
+                                    comment: "Draft download button label after the download starts")
+                           : String(localized: "settings.advanced.external_engine.get_draft",
+                                    defaultValue: "Download \(draftRepo)",
+                                    comment: "Button that downloads the draft model an external engine needs; placeholder is the Hugging Face repo")) {
+                        Task { await downloadDraft(draftRepo) }
+                    }
+                    .buttonStyle(.omlx(.normal, size: .small))
+                    .disabled(draftStarted)
+                    .help(draftError ?? "")
+                }
                 if !vm.externalEngine.isEmpty {
                     Popup(selection: vm.bind($vm.externalEngine, save: save),
                           width: .controlCompact,
@@ -1506,19 +1602,29 @@ private struct ExternalEngineRow: View {
                               .map { ($0.id, $0.label) })
                 }
                 RowSwitch(isOn: Binding(
-                    get: { !vm.externalEngine.isEmpty },
+                    get: { !vm.effectiveExternalEngine.isEmpty },
                     set: { on in
                         vm.externalEngine = on ? (usableEngine ?? "") : ""
                         save()
                     }
                 ))
-                .disabled(vm.externalEngine.isEmpty && usableEngine == nil)
+                .disabled(isGGUF || (vm.externalEngine.isEmpty && usableEngine == nil))
             }
         }
     }
 
     private func save() {
         Task { await vm.save(.externalEngine, client: client) }
+    }
+
+    private func downloadDraft(_ repo: String) async {
+        do {
+            _ = try await client.startHFDownload(repoId: repo)
+            draftStarted = true
+            draftError = nil
+        } catch {
+            draftError = error.omlxDescription
+        }
     }
 }
 
@@ -1541,7 +1647,7 @@ private struct ChatTemplateKwargsEditor: View {
                          : String(localized: "settings.advanced.chat_template.count",
                                   defaultValue: "kwargs: \(vm.chatTemplateEntries.count)",
                                   comment: "Count summary in the chat-template editor; placeholder is the entry count"))
-                        .font(.omlxText(12))
+                        .font(.omlxText(DesignTokens.FontSize.callout))
                         .foregroundStyle(theme.textSecondary)
                     Spacer()
                     addMenu
@@ -1623,7 +1729,7 @@ private struct EntryEditor: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
                 Text(typeLabel)
-                    .font(.omlxText(11, weight: .semibold))
+                    .font(.omlxText(DesignTokens.FontSize.subheadline, weight: .semibold))
                     .foregroundStyle(theme.textSecondary)
                 Spacer()
                 Button {
@@ -1719,7 +1825,7 @@ private struct EntryEditor: View {
                 defaultValue: "Custom",
                 comment: "Checkbox label that enables a custom reasoning_effort value"
             ))
-            .font(.omlxText(11))
+            .font(.omlxText(DesignTokens.FontSize.subheadline))
             .foregroundStyle(theme.textSecondary)
         }
         .toggleStyle(.checkbox)
@@ -1751,7 +1857,7 @@ private struct EntryEditor: View {
             Text(String(localized: "settings.advanced.chat_template.force",
                         defaultValue: "Force",
                         comment: "Checkbox label for forcing a chat-template kwarg via forced_ct_kwargs"))
-                .font(.omlxText(11))
+                .font(.omlxText(DesignTokens.FontSize.subheadline))
                 .foregroundStyle(theme.textSecondary)
         }
         .toggleStyle(.checkbox)
@@ -1792,6 +1898,29 @@ private struct AccelerationSection: View {
                         width: .controlWide,
                         options: ModelSettingsScreenVM.mtpDepthOptions
                     )
+                }
+            }
+
+            if vm.canImportMtplxSidecar {
+                Row(label: String(localized: "settings.acceleration.mtplx_import.label",
+                                  defaultValue: "MTPLX Side-car",
+                                  comment: "Row label for the one-time MTPLX side-car import action"),
+                    sublabel: String(localized: "settings.acceleration.mtplx_import.sub",
+                                     defaultValue: "Import the model's MTP head into its checkpoint index to unlock Lightning MTP.",
+                                     comment: "Sublabel for the MTPLX side-car import action")) {
+                    Button {
+                        Task { await vm.importMtplxSidecar(client: client) }
+                    } label: {
+                        if vm.isImportingMtplxSidecar {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Text(String(localized: "settings.acceleration.mtplx_import.button",
+                                        defaultValue: "Import MTPLX Side-car",
+                                        comment: "Button title that imports an MTPLX MTP side-car"))
+                        }
+                    }
+                    .buttonStyle(.omlx(.primary, size: .small))
+                    .disabled(vm.isImportingMtplxSidecar)
                 }
             }
 
@@ -1919,7 +2048,7 @@ private struct AccelerationSection: View {
                     sublabel: String(localized: "settings.acceleration.ced_prefill.sub",
                                      defaultValue: "Improves prefill speed by approximately 74–79% in tested configurations. Uses the model’s Causal Encoder–Decoder architecture to reduce decoder prefill computation.",
                                      comment: "Sublabel for the DeepSeek V4.1 CED prefill toggle"),
-                    isLast: !vm.isQwen4Exp && !vm.showsQwenOqA8) {
+                    isLast: !vm.isQwen4Exp && !vm.showsA8Prefill) {
                     RowSwitch(isOn: vm.bind($vm.deepseekV41CedPrefillEnabled, save: {
                         Task { await vm.save(.deepseekV41CedPrefill, client: client) }
                     }))
@@ -1930,27 +2059,27 @@ private struct AccelerationSection: View {
                                   defaultValue: "Qwen4 Extended Fused Decode",
                                   comment: "Row label for the Qwen4 extended fused decode toggle"),
                     sublabel: String(localized: "settings.acceleration.qwen4_wide_decode.sub",
-                                     defaultValue: "Speeds up decode on Qwen4 oQ2.5e, oQ2.7e, oQ6e, oQ8e and 8-bit community models (about 3-6% on an 8-bit model, up to 1.5 GiB more memory). No effect on oQ3e to oQ4e or fp16 builds, and little effect with Lightning MTP on.",
+                                     defaultValue: "Speeds up decode on Qwen4 oQ8e and other GDN layouts, such as some older oQ downloads and community models (up to 1.5 GiB more memory). No effect on current oQ2.5e to oQ6e or fp16 builds, and little effect with Lightning MTP on.",
                                      comment: "Sublabel for the Qwen4 extended fused decode toggle"),
-                    isLast: !vm.showsQwenOqA8) {
+                    isLast: !vm.showsA8Prefill) {
                     RowSwitch(isOn: vm.bind($vm.qwen4GdnDecodeWideProj, save: {
                         Task { await vm.save(.qwen4GdnDecodeWideProj, client: client) }
                     }))
                 }
             }
-            // The oQ A8 rows do not depend on an ANE backend: Qwen3.8
-            // Flash-Next has none, but still supports oQ A8.
-            if vm.showsQwenOqA8 {
+            // The A8 rows do not depend on an ANE backend: Qwen3.8 Flash-Next
+            // and DeepSeek V4.1 have none, but still support A8.
+            if vm.showsA8Prefill {
                 Row(label: String(localized: "settings.experimental.qwen_oq_a8.label",
-                                  defaultValue: "Qwen INT8 Activation Prefill",
+                                  defaultValue: "INT8 Activation Prefill",
                                   comment: "Row label for the oQ INT8-activation prefill kernels"),
-                    sublabel: qwenOqA8Sublabel,
-                    isLast: !vm.qwen35OqA8Enabled) {
-                    RowSwitch(isOn: vm.bindProfile($vm.qwen35OqA8Enabled))
-                        .disabled(vm.qwen35OqA8ConflictReason != nil)
-                        .help(vm.qwen35OqA8ConflictReason ?? "")
+                    sublabel: a8PrefillSublabel,
+                    isLast: !vm.a8PrefillEnabled) {
+                    RowSwitch(isOn: vm.bindProfile($vm.a8PrefillEnabled))
+                        .disabled(vm.a8PrefillConflictReason != nil)
+                        .help(vm.a8PrefillConflictReason ?? "")
                 }
-                if vm.qwen35OqA8Enabled {
+                if vm.a8PrefillEnabled {
                     Row(label: String(localized: "settings.experimental.qwen_oq_a8.min_tokens.label",
                                       defaultValue: "Minimum Prompt Tokens",
                                       comment: "Row label for the oQ A8 minimum prompt length"),
@@ -1958,7 +2087,7 @@ private struct AccelerationSection: View {
                                          defaultValue: "Shorter prompts stay on the existing path, where the activation-quantization pass costs more than the faster matmul saves.",
                                          comment: "Sublabel explaining the oQ A8 minimum prompt length"),
                         isLast: true) {
-                        TextInput(text: vm.bindProfile($vm.qwen35OqA8MinTokens),
+                        TextInput(text: vm.bindProfile($vm.a8PrefillMinTokens),
                                   placeholder: "128", mono: true,
                                   isNumeric: true, range: 1...262_144,
                                   step: 64, width: .controlCompact)
@@ -1969,13 +2098,13 @@ private struct AccelerationSection: View {
     }
 
     private var hasFamilyRows: Bool {
-        vm.isDeepseekV41 || vm.isQwen4Exp || vm.showsQwenOqA8
+        vm.isDeepseekV41 || vm.isQwen4Exp || vm.showsA8Prefill
     }
 
-    private var qwenOqA8Sublabel: String {
-        if let reason = vm.qwen35OqA8ConflictReason { return reason }
+    private var a8PrefillSublabel: String {
+        if let reason = vm.a8PrefillConflictReason { return reason }
         return String(localized: "settings.experimental.qwen_oq_a8.sub",
-                      defaultValue: "Experimental GPU INT8 activation quantization for supported Q4/Q5/Q8 prefill operations on Qwen3.5/3.6/3.8, and routed expert gate/up projections on Qwen3.8 Flash-Next. Requires M5-series or newer and the native kernels. Outputs and model quality may change; some quantization formats receive no acceleration. Cannot be combined with ANE prefill. Applies after the model reloads.",
+                      defaultValue: "Experimental GPU INT8 activation quantization for supported Q4/Q5/Q8 prefill operations on Qwen3.5/3.6/3.8, routed expert gate/up projections on Qwen3.8 Flash-Next, and the expert and attention projections of DeepSeek V4.1. Requires M5-series or newer and the native kernels. Outputs and model quality may change; some quantization formats receive no acceleration. Cannot be combined with ANE prefill. Applies after the model reloads.",
                       comment: "Sublabel describing the oQ INT8-activation prefill kernels")
     }
 
@@ -2068,7 +2197,7 @@ private struct ExperimentalSection: View {
                 }
             }
             if vm.model?.anePrefillBackend != nil {
-                if vm.isQwenOqA8Model {
+                if vm.isA8PrefillModel {
                     Row(label: String(localized: "settings.experimental.qwen_ane.label",
                                       defaultValue: "Qwen ANE Prefill",
                                       comment: "Row label for private Qwen ANE/GPU prefill acceleration"),
@@ -2123,7 +2252,7 @@ private struct ExperimentalSection: View {
                         if vm.aneTuningIsRunning {
                             if let status = vm.aneTuningStatus {
                                 Text(status.message)
-                                    .font(.omlxText(11))
+                                    .font(.omlxText(DesignTokens.FontSize.subheadline))
                                     .foregroundStyle(theme.textSecondary)
                                     .fixedSize(horizontal: false, vertical: true)
                                     .multilineTextAlignment(.trailing)
@@ -2144,7 +2273,7 @@ private struct ExperimentalSection: View {
                             .buttonStyle(.omlx(.destructive, size: .small))
                         } else if let recommendation = vm.aneTuningStatus?.recommendation {
                             Text(aneRecommendationText(recommendation))
-                                .font(.omlxText(11))
+                                .font(.omlxText(DesignTokens.FontSize.subheadline))
                                 .foregroundStyle(theme.textSecondary)
                                 .fixedSize(horizontal: false, vertical: true)
                                 .multilineTextAlignment(.trailing)
@@ -2173,7 +2302,7 @@ private struct ExperimentalSection: View {
                             if let reason = status.terminationReason,
                                !reason.isEmpty {
                                 Text(reason)
-                                    .font(.omlxText(10))
+                                    .font(.omlxText(DesignTokens.FontSize.caption))
                                     .foregroundStyle(
                                         status.status == "error"
                                             ? Color.red
@@ -2512,10 +2641,13 @@ enum SamplingValidator {
                                                   defaultValue: "Top K must be an integer.",
                                                   comment: "Validation error when top-k isn't an integer")))
         }
-        guard v >= 1 else {
+        // 0 turns top-k off: that is how the server's settings, the web dashboard
+        // and mlx-lm's sampler already read it, and the global Server screen
+        // accepts it too; only this per-model check refused it (#4649).
+        guard v >= 0 else {
             return .failure(.init(message: String(localized: "settings.validator.top_k.positive",
-                                                  defaultValue: "Top K must be a positive integer.",
-                                                  comment: "Validation error when top-k isn't positive")))
+                                                  defaultValue: "Top K must be 0 or a positive integer.",
+                                                  comment: "Validation error when top-k is negative")))
         }
         return .success(v)
     }
@@ -2542,5 +2674,125 @@ enum SamplingValidator {
         }
         if let msg = check(v) { return .failure(.init(message: msg)) }
         return .success(v)
+    }
+}
+
+// MARK: - GPU power limit guide
+
+/// M5 Max measurements that show what a GPU power limit costs and saves.
+/// Shared by the model settings and Ask AI rows.
+struct GPUPowerGuide: View {
+    static var unsupportedText: String {
+        String(localized: "settings.gpu_power_guide.unsupported",
+               defaultValue: "This Mac's GPU does not support a power limit.",
+               comment: "Shown instead of the GPU power limit description when the GPU rejects a power cap")
+    }
+
+    /// Limit, answer speed, energy per token, prompt speed.
+    private static let rows: [(String, String, String, String)] = [
+        ("30-40 W", "0%", "0%", "-14 ~ -30%"),
+        ("20 W", "-3 ~ -4%", "-11 ~ -12%", "-38 ~ -44%"),
+        ("15 W", "-6 ~ -7%", "-25 ~ -29%", "-49 ~ -53%"),
+        ("10 W", "-14 ~ -18%", "-37 ~ -43%", "-59 ~ -64%"),
+        ("5 W", "-36 ~ -48%", "-49 ~ -52%", "-75 ~ -78%"),
+        ("2 W", "-67 ~ -78%", "-47 ~ -52%", "-90 ~ -91%"),
+    ]
+
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(String(localized: "settings.gpu_power_guide.title",
+                        defaultValue: "Measured on M5 Max (other chips differ)",
+                        comment: "Title of the GPU power limit guide popover"))
+                .font(.omlxText(DesignTokens.FontSize.callout, weight: .semibold))
+            Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 4) {
+                GridRow {
+                    Text(String(localized: "settings.gpu_power_guide.limit",
+                                defaultValue: "Limit",
+                                comment: "GPU power guide column: the power limit"))
+                    Text(String(localized: "settings.gpu_power_guide.answer",
+                                defaultValue: "Answer speed",
+                                comment: "GPU power guide column: change in token generation speed"))
+                    Text(String(localized: "settings.gpu_power_guide.energy",
+                                defaultValue: "Energy per token",
+                                comment: "GPU power guide column: change in energy used per generated token"))
+                    Text(String(localized: "settings.gpu_power_guide.prompt",
+                                defaultValue: "Prompt speed",
+                                comment: "GPU power guide column: change in prompt processing speed"))
+                }
+                .foregroundStyle(theme.textSecondary)
+                GridRow {
+                    Text(String(localized: "settings.gpu_power_guide.none",
+                                defaultValue: "No limit",
+                                comment: "GPU power guide row for running without a power limit"))
+                    Text(verbatim: "GPU 23-27 W")
+                    Text(verbatim: "-")
+                    Text(verbatim: "GPU 67-76 W")
+                }
+                ForEach(Self.rows, id: \.0) { row in
+                    GridRow {
+                        Text(verbatim: row.0)
+                        Text(verbatim: row.1)
+                        Text(verbatim: row.2)
+                        Text(verbatim: row.3)
+                    }
+                }
+            }
+            .font(.omlxText(DesignTokens.FontSize.subheadline).monospacedDigit())
+            Text(String(localized: "settings.gpu_power_guide.note",
+                        defaultValue: "30 W or more barely changes answer speed. Below 5 W, energy per token stops falling and answers only get slower. The minimum is 2 W. Other requests and apps also slow down while the limit is active. Benchmarks run without it.",
+                        comment: "Footnote of the GPU power limit guide popover"))
+                .font(.omlxText(DesignTokens.FontSize.subheadline))
+                .foregroundStyle(theme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(14)
+        .frame(width: 400, alignment: .leading)
+    }
+}
+
+struct GPUPowerGuideButton: View {
+    @State private var isShown = false
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        Button {
+            isShown.toggle()
+        } label: {
+            Image(systemName: "info.circle")
+                .font(.system(size: 12))
+                .foregroundStyle(theme.textSecondary)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(String(localized: "settings.gpu_power_guide.button",
+                     defaultValue: "How much does a limit save?",
+                     comment: "Tooltip on the info button that opens the GPU power limit guide"))
+        .popover(isPresented: $isShown, arrowEdge: .bottom) {
+            GPUPowerGuide()
+        }
+    }
+}
+
+/// Shown under a benchmark model picker: benchmarks never take a model's
+/// GPU power limit, so their numbers are full-power numbers.
+struct GPUPowerBenchNotice: View {
+    let model: ModelDTO?
+
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        if let watts = model?.settings?.gpuPowerLimitW, watts > 0 {
+            FreeRow {
+                Label(String(localized: "bench.gpu_power_limit_note",
+                             defaultValue: "This model's \(watts) W GPU power limit does not apply to benchmarks.",
+                             comment: "Note under a benchmark model picker when the model has a GPU power limit; placeholder is the watt value"),
+                      systemImage: "info.circle")
+                    .font(.omlxText(DesignTokens.FontSize.callout))
+                    .foregroundStyle(theme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 }
