@@ -12,6 +12,9 @@ import pytest
 try:
     import mlx.core as mx
     import mlx.nn as nn
+    from mlx.utils import tree_flatten
+
+    from omlx.patches.inkling2.vision import VisionArgs, VisionTower
 
     HAS_MLX = True
 except ImportError:
@@ -2773,6 +2776,32 @@ def _write_safetensors(path, tensors):
         f.write(hdr_bytes)
         for part in data_parts:
             f.write(part)
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestSparkXLayerDiscovery:
+    def test_spark2_5_embedding_is_found(self):
+        """Spark-X keeps its token embedding at ``model.model.embedding`` (#4838)."""
+        pytest.importorskip("mlx_lm.models.spark2_5")
+        from mlx_lm.models import spark2_5
+
+        model = spark2_5.Model(
+            spark2_5.ModelArgs(
+                model_type="spark2_5",
+                hidden_size=16,
+                intermediate_size=32,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                head_dim=8,
+                vocab_size=32,
+                sliding_window=4,
+                rope_parameters={"sliding_attention": {"rope_theta": 10000.0}},
+            )
+        )
+        embed_fn, layers = _find_model_layers(model)
+        assert embed_fn is model.model.embedding
+        assert layers is model.model.layers
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
@@ -7572,6 +7601,19 @@ class TestTextOnlyMultimodalMetadata:
         assert not (out / "preprocessor_config.json").exists()
         assert not (out / "processor_config.json").exists()
 
+    def test_lfm3_omni_copies_codec(self, tmp_path):
+        from omlx.oq import _copy_model_sidecars
+
+        src = self._make_source(tmp_path)
+        (src / "audio_tokenizer").mkdir()
+        (src / "audio_tokenizer" / "config.json").write_text("{}")
+        out = tmp_path / "out"
+        out.mkdir()
+
+        _copy_model_sidecars(src, out, model_type="lfm3_omni")
+
+        assert (out / "audio_tokenizer" / "config.json").is_file()
+
     def test_multimodal_keeps_processor_sidecars(self, tmp_path):
         from omlx.oq import _copy_model_sidecars
 
@@ -9066,6 +9108,408 @@ class TestStreamedCalibration:
             np.testing.assert_array_equal(streamed[key].in_sum2, entry.in_sum2)
 
 
+# Tiny Inkling 2 source in the original layout. Layers 0-3 hold NVFP4 experts and
+# layers 4-5 MXFP8 ones; layer 5 is the only full-attention layer.
+_INK2_LAYERS = 6
+_INK2_NVFP4_LAYERS = 4
+_INK2_DIMS = {"hidden": 64, "experts": 8, "inter": 64, "vocab": 128}
+_INK2_ATTN = {"heads": 4, "kv": 2, "head_dim": 16, "d_rel": 4, "window": 8, "k": 4}
+_INK2_VISION = {
+    "hidden_size": 32,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 4,
+    "native_patch_size": 4,
+    "adapter_merge_size": 2,
+    "posemb_grid_size": 4,
+    "projection_hidden_dim": 64,
+    "mlp_ratio": 2.0,
+}
+
+
+def _inkling2_source(path, *, seed=0):
+    path.mkdir(parents=True)
+    rng = np.random.default_rng(seed)
+    h, e, inter, vocab = (
+        _INK2_DIMS[k] for k in ("hidden", "experts", "inter", "vocab")
+    )
+    heads, kv, hd, d_rel, window, k = (
+        _INK2_ATTN[n] for n in ("heads", "kv", "head_dim", "d_rel", "window", "k")
+    )
+    dq, dkv, dr = heads * hd, kv * hd, heads * d_rel
+    full = _INK2_LAYERS - 1
+
+    def bf16(*shape, scale=0.05):
+        a = (rng.standard_normal(shape) * scale).astype(np.float32)
+        return (a.view(np.uint32) >> 16).astype(np.uint16).tobytes(), shape, "BF16"
+
+    def f32(*shape):
+        a = (rng.standard_normal(shape) * 0.05).astype(np.float32)
+        return a.tobytes(), shape, "F32"
+
+    def raw(a, dtype):
+        return np.ascontiguousarray(a).tobytes(), a.shape, dtype
+
+    t = {}
+    root = "model.llm."
+    t[root + "embed.weight"] = bf16(vocab, h)
+    t[root + "embed_norm.weight"] = bf16(h, scale=1.0)
+    t[root + "norm.weight"] = bf16(h, scale=1.0)
+    t[root + "unembed.weight"] = bf16(vocab, h)
+    for i in range(_INK2_LAYERS - 1):
+        t[root + f"attn_res.attn_queries.{i}"] = f32(
+            *((3, h) if i + 1 == full else (h,))
+        )
+    for i in range(_INK2_LAYERS):
+        t[root + f"attn_res.mlp_queries.{i}"] = f32(h)
+    t[root + "attn_res.output_query"] = f32(h)
+    for i in range(_INK2_LAYERS):
+        q = root + f"layers.{i}."
+        t[q + "attn.wq_du.weight"] = bf16(dq, h)
+        t[q + "attn.wk_dv.weight"] = bf16(dkv, h)
+        t[q + "attn.wv_dv.weight"] = bf16(dkv, h)
+        t[q + "attn.wr_du.weight"] = bf16(dr, h)
+        t[q + "attn.gate_attn.weight"] = bf16(dq, h)
+        t[q + "attn.attn_sink_proj.weight"] = bf16(heads, h)
+        if i == full:
+            for n in "kv":
+                t[q + f"attn.{n}_sconv.weight_proj"] = bf16(kv * k, h)
+                t[q + f"attn.{n}_sconv.static_w"] = bf16(k, dkv)
+            for n in "qkv":
+                t[q + f"{n}_input_norm.weight"] = bf16(h, scale=1.0)
+        else:
+            t[q + "attn.k_sconv.weight"] = bf16(dkv, 1, k)
+            t[q + "attn.v_sconv.weight"] = bf16(dkv, 1, k)
+            t[q + "attn_norm.weight"] = bf16(h, scale=1.0)
+        t[q + "attn.wo_ud.weight"] = bf16(h, dq)
+        t[q + "attn.q_l2_clip.scale"] = bf16(heads, hd, scale=1.0)
+        t[q + "attn.rel_l2_clip.scale"] = bf16(heads, d_rel, scale=1.0)
+        t[q + "attn.rel_logits_proj.proj"] = bf16(d_rel, window)
+        t[q + "attn_sconv.weight"] = bf16(h, 1, k)
+        t[q + "mlp_sconv.weight"] = bf16(h, 1, k)
+        t[q + "mlp_norm.weight"] = bf16(h, scale=1.0)
+        t[q + "mlp.gate.weight"] = bf16(e, h)
+        t[q + "mlp.gate.bias"] = f32(e)
+        for proj, (rows, cols) in (("w13", (2 * inter, h)), ("w2", (h, inter))):
+            ex = q + f"mlp.experts.{proj}_weight"
+            if i < _INK2_NVFP4_LAYERS:
+                packed = rng.integers(0, 256, (e, rows, cols // 2), dtype=np.uint8)
+                scale = rng.integers(0x30, 0x41, (e, rows, cols // 16), dtype=np.uint8)
+                t[ex] = raw(packed, "U8")
+                t[ex + "_scale"] = raw(scale, "F8_E4M3")
+                t[ex + "_amax"] = raw(rng.uniform(20, 40, e).astype(np.float32), "F32")
+                denom = np.array([2688.0], np.float32)
+                t[ex + "_outer_scale_denominator"] = raw(denom, "F32")
+            else:
+                body = rng.integers(0, 0x7F, (e, rows, cols), dtype=np.uint8)
+                body |= rng.integers(0, 2, (e, rows, cols), dtype=np.uint8) << 7
+                scale = rng.integers(118, 121, (e, rows, cols // 32), dtype=np.uint8)
+                t[ex] = raw(body, "F8_E4M3")
+                t[ex + "_scale"] = raw(scale, "U8")
+    tower = VisionTower(VisionArgs.from_dict(_INK2_VISION), h)
+    for name, value in tree_flatten(tower.parameters()):
+        t["model.visual." + name] = bf16(*value.shape)
+    _write_safetensors(str(path / "model.safetensors"), t)
+    config = {
+        "model_type": "inkling2",
+        "eos_token_id": 3,
+        "text_config": {
+            "hidden_size": h,
+            "num_hidden_layers": _INK2_LAYERS,
+            "vocab_size": vocab,
+            "unpadded_vocab_size": vocab - 8,
+            "num_attention_heads": heads,
+            "num_key_value_heads": kv,
+            "head_dim": hd,
+            "swa_num_attention_heads": heads,
+            "swa_num_key_value_heads": kv,
+            "swa_head_dim": hd,
+            "d_rel": d_rel,
+            "rel_extent": window,
+            "sliding_window_size": window,
+            "local_layer_ids": list(range(_INK2_LAYERS - 1)),
+            "sconv_kernel_size": k,
+            "n_routed_experts": e,
+            "num_experts_per_tok": 2,
+            "intermediate_size": inter,
+        },
+        "vision_config": _INK2_VISION,
+        "mtp_config": {"num_hidden_layers": 1},
+    }
+    (path / "config.json").write_text(json.dumps(config))
+    (path / "mtp.safetensors").write_bytes(b"draft")
+    (path / "tiktoken").mkdir()
+    (path / "tiktoken" / "tokenizer.model").write_bytes(b"table")
+    for name in ("tokenizer.json", "chat_template.jinja", "processor_config.json"):
+        (path / name).write_text("{}")
+    (path / "hf_quant_config.json").write_text('{"quant_method": "inkling2"}')
+
+
+@pytest.fixture(scope="module")
+def inkling2_source(tmp_path_factory):
+    source = tmp_path_factory.mktemp("inkling2") / "source"
+    _inkling2_source(source)
+    return source
+
+
+def _inkling2_model(path):
+    from mlx_lm.utils import load_model
+    from omlx.patches.inkling2 import apply_inkling2_patch
+
+    apply_inkling2_patch()
+    return load_model(Path(path), lazy=True)[0]
+
+
+def _quantize_inkling2(source, output, level, **kwargs):
+    import omlx.oq as oq
+
+    kwargs.setdefault("sensitivity_map_override", {i: 1.0 for i in range(_INK2_LAYERS)})
+    oq.quantize_oq_streaming(str(source), str(output), level, **kwargs)
+    return json.loads((output / "config.json").read_text()), mx.load(
+        str(output / "model.safetensors")
+    )
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestInkling2OQ:
+    NVFP4 = {"bits": 4, "group_size": 16, "mode": "nvfp4"}
+    MXFP8 = {"bits": 8, "group_size": 32, "mode": "mxfp8"}
+
+    @pytest.mark.parametrize("text_only", [True, False])
+    def test_sanitizer_matches_runtime_loader(self, inkling2_source, text_only):
+        from omlx.patches.inkling2.loader import sanitize_weights
+        from omlx.patches.inkling2.model import ModelArgs
+
+        config = json.loads((inkling2_source / "config.json").read_text())
+        files = _source_weight_files(inkling2_source)
+        idx = _LazyTensorIndex(files, config=config)
+        sanitize = _build_model_sanitizer(config, text_only=text_only)
+        plan = _DiscoveredPlan(_discover_sanitize_plan(sanitize, idx), idx)
+        assert any(key.startswith("vision_tower.") for key in plan.keys()) == (
+            not text_only
+        )
+        # The runtime's loader maps the raw tensors; oQ replays the same mapping.
+        source = _LazyTensorIndex(files)
+        raw = {key: source[key] for key in source.keys()}
+        model = MagicMock()
+        model.args = ModelArgs.from_dict(config)
+        model.vision_tower = None if text_only else object()
+        loaded, _ = sanitize_weights(model, raw)
+        expected = {
+            key: value for key, value in loaded.items() if ".mlp.experts." not in key
+        }
+        assert {k for k in plan.keys() if ".mlp.experts." not in k} == expected.keys()
+        for key, value in expected.items():
+            got = plan.pop(key)
+            assert got.shape == value.shape and got.dtype == value.dtype, key
+            assert mx.array_equal(got, value).item(), key
+        # Experts keep their carriers and the tensor scales the loader derives.
+        for key in (k for k in loaded if k.endswith(".global_scale")):
+            assert mx.array_equal(plan.pop(key), loaded[key]).item(), key
+        for layer in range(_INK2_LAYERS):
+            for proj in ("w13", "w2"):
+                key = f"model.layers.{layer}.mlp.experts.{proj}.weight"
+                weight, scales = plan.pop_packed(key)
+                base = key[: -len("weight")]
+                assert mx.array_equal(weight, loaded[base + "weight"]).item()
+                assert mx.array_equal(scales, loaded[base + "scales"]).item()
+
+    def test_oq4_passes_native_experts_through(self, inkling2_source, tmp_path):
+        output = tmp_path / "oq4"
+        config, tensors = _quantize_inkling2(inkling2_source, output, 4)
+        quant = config["quantization"]
+        for layer in range(_INK2_NVFP4_LAYERS):
+            for proj in ("w13", "w2"):
+                assert quant[f"model.layers.{layer}.mlp.experts.{proj}"] == self.NVFP4
+        # MXFP8 layers requantize at the level's bits, the default entry.
+        assert not any(
+            f"layers.{i}.mlp.experts" in key for i in (4, 5) for key in quant
+        )
+        assert (quant["bits"], quant["mode"]) == (4, "affine")
+        assert quant["model.embed"]["bits"] == 8
+        assert "vision_config" in config and "mtp_config" in config
+        assert sorted(p.name for p in output.iterdir()) == [
+            "chat_template.jinja",
+            "config.json",
+            "model.safetensors",
+            "mtp.safetensors",
+            "processor_config.json",
+            "tokenizer.json",
+        ]
+        assert (output / "mtp.safetensors").read_bytes() == b"draft"
+
+        idx = _LazyTensorIndex(_source_weight_files(inkling2_source))
+        root = "model.llm.layers.0.mlp.experts.w13_weight"
+        pre = "model.layers.0.mlp.experts.w13."
+        assert mx.array_equal(
+            tensors[pre + "weight"], idx.load_source(root).view(mx.uint32)
+        ).item()
+        assert mx.array_equal(
+            tensors[pre + "scales"], idx.load_source(root + "_scale")
+        ).item()
+        assert mx.array_equal(
+            tensors[pre + "global_scale"], idx.load_source(root + "_amax")
+        ).item()
+        assert not any(k.startswith(("model.llm.", "model.visual")) for k in tensors)
+        assert "model.layers.4.mlp.experts.w13.global_scale" not in tensors
+        assert tensors["model.layers.4.mlp.experts.w13.biases"].dtype == mx.bfloat16
+        # FP32 stays FP32; conv weights, norms and scales keep the source dtype.
+        for key in (
+            "model.layers.1.mlp.router_weight",
+            "model.layers.1.mlp.router_bias",
+            "model.layers.5.attn_input.query",
+            "model.layers.2.mlp_input.query",
+            "model.final_input.query",
+        ):
+            assert tensors[key].dtype == mx.float32, key
+        assert tensors["model.layers.5.attn_input.query"].shape == (3, 64)
+        for key in ("model.layers.0.attn.k_conv", "model.layers.5.attn.k_static"):
+            assert tensors[key].dtype == mx.bfloat16, key
+        assert tensors["model.layers.0.attn.in_proj.weight"].dtype == mx.uint32
+        assert "model.layers.5.attn.k_proj.scales" in tensors
+
+    def test_oq8_passes_both_formats_through(self, inkling2_source, tmp_path):
+        config, tensors = _quantize_inkling2(inkling2_source, tmp_path / "oq8", 8)
+        quant = config["quantization"]
+        assert quant["model.layers.0.mlp.experts.w2"] == self.NVFP4
+        assert quant["model.layers.5.mlp.experts.w13"] == self.MXFP8
+        idx = _LazyTensorIndex(_source_weight_files(inkling2_source))
+        source = "model.llm.layers.5.mlp.experts.w13_weight"
+        assert mx.array_equal(
+            tensors["model.layers.5.mlp.experts.w13.weight"],
+            idx.load_source(source).view(mx.uint32),
+        ).item()
+        assert "model.layers.5.mlp.experts.w13.biases" not in tensors
+
+    def test_oq35_mixes_carriers_and_folds_the_tensor_scale(
+        self, inkling2_source, tmp_path
+    ):
+        config, tensors = _quantize_inkling2(inkling2_source, tmp_path / "oq35", 3.5)
+        quant = config["quantization"]
+        # Down projections pass through at 4 bits, gate/up requantize to 3.
+        assert quant["model.layers.1.mlp.experts.w2"] == self.NVFP4
+        assert "model.layers.1.mlp.experts.w13" not in quant
+        assert "model.layers.1.mlp.experts.w2.global_scale" in tensors
+        assert "model.layers.1.mlp.experts.w13.global_scale" not in tensors
+        assert quant["model.layers.4.mlp.experts.w2"]["mode"] == "affine"
+
+        idx = _LazyTensorIndex(_source_weight_files(inkling2_source))
+        base = "model.llm.layers.1.mlp.experts.w13_weight"
+        real = (
+            mx.dequantize(
+                idx.load_source(base).view(mx.uint32),
+                idx.load_source(base + "_scale"),
+                None,
+                group_size=16,
+                bits=4,
+                mode="nvfp4",
+                dtype=mx.float32,
+            )
+            * (idx.load_source(base + "_amax") / 2688.0)[:, None, None]
+        )
+        pre = "model.layers.1.mlp.experts.w13."
+        got = mx.dequantize(
+            tensors[pre + "weight"],
+            tensors[pre + "scales"],
+            tensors[pre + "biases"],
+            group_size=64,
+            bits=3,
+            mode="affine",
+            dtype=mx.float32,
+        )
+        # Without the tensor scale the weights would be off by about 2688 / amax.
+        assert (mx.linalg.norm(got - real) / mx.linalg.norm(real)).item() < 0.5
+
+    def test_layer_walk_reproduces_the_forward(self, inkling2_source):
+        from omlx.patches.inkling2 import oq_layout
+
+        model = _inkling2_model(inkling2_source)
+        tokens = mx.arange(1, 25)[None]
+        embed_fn, layers = _find_model_layers(model)
+        inputs = embed_fn(tokens)
+        inputs, masks, state = _prepare_layer_inputs(model, layers, tokens, inputs)
+        for i, block in enumerate(layers):
+            inputs, aux = _forward_layer_result(block, inputs, masks[i], state, i)
+            _commit_layer_forward_aux(state, i, aux)
+        # Layer 0 completes the first block; the last block closes at the end.
+        assert len(state["blocks"]) == 1
+        logits = model.logits_from_hidden(
+            oq_layout.head_input(model, inputs, state["blocks"])
+        )
+        expected = model(tokens)
+        assert mx.allclose(
+            logits[..., :120], expected[..., :120], rtol=1e-4, atol=1e-4
+        ).item()
+
+    def test_oqe_weights_requantized_experts_and_skips_passthrough(
+        self, inkling2_source, tmp_path, monkeypatch
+    ):
+        import omlx.oq as oq
+        import omlx.utils.model_loading as model_loading
+
+        tokens = mx.array(np.random.default_rng(1).integers(1, 120, (3, 24)), mx.int32)
+        monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **kw: tokens)
+        monkeypatch.setattr(
+            model_loading,
+            "lm_load_compat",
+            lambda path, **kw: (_inkling2_model(path), object()),
+        )
+        monkeypatch.setattr(
+            model_loading, "maybe_apply_pre_load_patches", lambda *a, **kw: None
+        )
+        output = tmp_path / "oqe4"
+        cache = tmp_path / "imatrix.npz"
+        _quantize_inkling2(
+            inkling2_source,
+            output,
+            4,
+            enhanced=True,
+            imatrix_cache_path=str(cache),
+            imatrix_num_samples=3,
+            imatrix_seq_length=24,
+        )
+        report = json.loads((output / "oq_imatrix_report.json").read_text())
+        assert not report["missing"] and not report["mismatched"]
+        applied = set(report["applied"])
+        assert {"lm_head", "model.layers.4.mlp.experts.w13"} <= applied
+        assert "model.layers.5.mlp.experts.w2" in applied
+        # NVFP4 experts pass through, so nothing was captured for them.
+        assert not any(
+            f"layers.{i}.mlp.experts" in name for i in range(4) for name in applied
+        )
+        skipped = json.loads(Path(str(cache) + ".json").read_text())["capture_skip"]
+        assert "model.layers.3.mlp.experts.w2" in skipped
+        assert "model.layers.4.mlp.experts.w2" not in skipped
+
+    def test_converted_checkpoint_loads_and_runs(self, inkling2_source, tmp_path):
+        from omlx.patches.inkling2.model import ExpertProj
+
+        if not hasattr(ExpertProj, "to_quantized"):
+            # mlx-lm hands every per-module quantization entry to nn.quantize,
+            # which rejects a module without to_quantized.
+            pytest.xfail(
+                "ExpertProj needs a to_quantized hook for converted checkpoints"
+            )
+        tokens = mx.arange(1, 21)[None]
+        # Two images of 2 x 2 and 1 x 3 image tokens, 8 px blocks each.
+        pixels = mx.random.uniform(-1, 1, (7, 8, 8, 3), key=mx.random.key(0))
+        grid = [[1, 2, 2], [1, 1, 3]]
+        source = _inkling2_model(inkling2_source)
+        reference = source(tokens)[..., :120]
+        features = source.encode_image(pixels, grid)
+        for level in (4, 8):
+            output = tmp_path / f"load{level}"
+            _, weights = _quantize_inkling2(inkling2_source, output, level)
+            # oQ keeps the vision tower unquantized.
+            assert not any(
+                k.startswith("vision_tower.") and k.endswith(".scales") for k in weights
+            )
+            model = _inkling2_model(output)
+            logits = model(tokens)[..., :120]
+            assert logits.shape == reference.shape
+            assert mx.isfinite(logits).all().item()
+            assert mx.array_equal(model.encode_image(pixels, grid), features).item()
+
+
 class TestGemma4AudioConfigSanitize:
     """Gemma 4 E2B/E4B sanitize reads audio_config.subsampling_conv_channels.
 
@@ -9096,3 +9540,146 @@ class TestGemma4AudioConfigSanitize:
         out = sanitize({"model." + key: mx.zeros((32, 128, 3, 3))})
         assert list(out) == [key]
         assert out[key].shape == (32, 3, 3, 128)
+
+
+# =============================================================================
+# Test VLM sanitizers that call super() (LFM3-Omni, #5129)
+# =============================================================================
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestLfm3OmniSanitize:
+    """LFM3-Omni's ``Model.sanitize`` calls ``super().sanitize()``."""
+
+    CONFIG = {
+        "model_type": "lfm3_omni",
+        "architectures": ["Lfm3OmniForConditionalGeneration"],
+        "text_config": {
+            "model_type": "lfm3",
+            "num_hidden_layers": 2,
+            "layer_types": ["conv", "full_attention"],
+            "tie_word_embeddings": True,
+        },
+        "vision_config": {
+            "model_type": "lfm3_vl_vision",
+            "num_hidden_layers": 1,
+            "layer_types": ["conv"],
+        },
+        "audio_encoder_config": {
+            "text_config": {
+                "model_type": "lfm2",
+                "hidden_size": 768,
+                "num_hidden_layers": 1,
+                "layer_types": ["conv"],
+                "vocab_size": 2,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 4,
+                "max_position_embeddings": 128000,
+                "norm_eps": 1e-05,
+                "conv_bias": False,
+                "conv_L_cache": 3,
+                "block_ff_dim": 2560,
+                "block_multiple_of": 256,
+                "block_ffn_dim_multiplier": 1.0,
+                "block_auto_adjust_ff_dim": True,
+            }
+        },
+        "depth_config": {
+            "model_type": "lfm3",
+            "num_hidden_layers": 1,
+            "layer_types": ["full_attention"],
+        },
+    }
+
+    # Checkpoint name -> (loader name, checkpoint shape, loader shape)
+    WEIGHTS = {
+        "model.audio_encoder.lfm.layers.2.self_attn.q_proj.weight": (
+            "audio_tower.lfm.layers.2.self_attn.q_proj.weight",
+            (16, 16),
+            (16, 16),
+        ),
+        "model.audio_encoder.lfm.layers.0.conv.conv.weight": (
+            "audio_tower.lfm.layers.0.conv.conv.weight",
+            (16, 1, 3),
+            (16, 3, 1),
+        ),
+        "model.language_model.layers.1.self_attn.q_proj.weight": (
+            "language_model.model.layers.1.self_attn.q_proj.weight",
+            (8, 8),
+            (8, 8),
+        ),
+        "model.audio_projector.linear_1.weight": (
+            "audio_projector.linear_1.weight",
+            (4, 4),
+            (4, 4),
+        ),
+    }
+
+    def test_sanitize_uses_loader_names(self, tmp_path):
+        pytest.importorskip("mlx_vlm.models.lfm3_omni")
+        expected = {target: loaded for target, _, loaded in self.WEIGHTS.values()}
+        sanitize = _build_model_sanitizer(self.CONFIG, text_only=False)
+
+        out = sanitize(
+            {name: mx.zeros(shape) for name, (_, shape, _) in self.WEIGHTS.items()}
+        )
+        assert {name: value.shape for name, value in out.items()} == expected
+
+        path = tmp_path / "model.safetensors"
+        _write_safetensors(
+            str(path),
+            {
+                name: np.zeros(shape, dtype=np.float16)
+                for name, (_, shape, _) in self.WEIGHTS.items()
+            },
+        )
+        plan = _discover_sanitize_plan(sanitize, _LazyTensorIndex([str(path)]))
+        assert plan is not None
+        assert {name: tuple(info["shape"]) for name, info in plan.items()} == expected
+
+    def test_speech_modules_stay_float(self):
+        from omlx.oq import _budgeted_shapes
+
+        speech = "depth_decoder.model.layers.2.self_attn.q_proj"
+        backbone = "language_model.model.layers.0.self_attn.q_proj"
+        config = {
+            "model_type": "lfm3_omni",
+            "_oq_use_budget_plan": True,
+            "_oq_boost_map": {speech: {"bits": 8, "group_size": 64}},
+        }
+        assert universal_quant_predicate(speech, None, config, 4) is False
+        assert universal_quant_predicate(backbone, None, config, 4) is not False
+        shapes = {speech: (64, 64), backbone: (64, 64)}
+        assert _budgeted_shapes(shapes, config) == {backbone: (64, 64)}
+
+    def test_lfm3_calibration_matches_native_layer_walk(self):
+        from mlx_vlm.models.lfm3.config import ModelConfig
+        from mlx_vlm.models.lfm3.language import Lfm3Model
+
+        from omlx.oq import _layer_masks_for_model
+
+        config = ModelConfig.from_dict(
+            {
+                "model_type": "lfm3",
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "num_hidden_layers": 3,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 8,
+                "vocab_size": 64,
+                "layer_types": ["conv", "full_attention", "sliding_attention"],
+                "sliding_window": 4,
+            }
+        )
+        model = Lfm3Model(config)
+        tokens = mx.array([[1, 2, 3, 4, 5, 6], [6, 5, 4, 3, 2, 1]])
+        hidden = model.embed_tokens(tokens)
+        masks = _layer_masks_for_model(model, model.layers, hidden)
+        assert masks[0] is None
+        for layer, mask in zip(model.layers, masks):
+            hidden = _forward_layer(layer, hidden, mask, None)
+            assert hidden.shape == (2, 6, 32)
+        actual = model.embedding_norm(hidden)
+        expected = model(tokens)
+        assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5).item()
