@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -12,6 +13,9 @@ logger = logging.getLogger(__name__)
 _MODEL_TYPE = "unlimited-ocr"
 
 _APPLIED = False
+
+_LEADING_PAGE_MARKERS_RE = re.compile(r"^\s*(?:<PAGE>\s*)+")
+_INVERTED_IMAGE_PAGE_RE = re.compile(r"^\s*(?:<image>\s*)+(?:<PAGE>\s*)+")
 
 
 _UNLIMITED_OCR_DEFAULT_TEMPLATE = (
@@ -29,10 +33,11 @@ class _UnlimitedOCRDefaultChatTemplateProperty(property):
 
 
 def apply_mlx_vlm_unlimited_ocr_compat_patch() -> bool:
-    """Wrap mlx-vlm's get_message_json for Unlimited-OCR prompts."""
+    """Wrap mlx-vlm's get_message_json and UnlimitedOCRProcessor helpers."""
     global _APPLIED
     if _APPLIED:
         _patch_processor_chat_template()
+        _patch_processor_page_prompt()
         return False
 
     try:
@@ -40,6 +45,7 @@ def apply_mlx_vlm_unlimited_ocr_compat_patch() -> bool:
 
         _patch_prompt_utils(prompt_utils)
         _patch_processor_chat_template()
+        _patch_processor_page_prompt()
     except Exception as exc:  # noqa: BLE001
         logger.debug("Unlimited-OCR mlx-vlm compat patch failed: %s", exc)
         return False
@@ -82,6 +88,62 @@ def _patch_processor_chat_template() -> bool:
     return True
 
 
+def _patch_processor_page_prompt() -> bool:
+    """Repair inverted ``<image><PAGE>`` prompts on Unlimited-OCR-2 processors."""
+    try:
+        from mlx_vlm.models.unlimited_ocr.processing_unlimitedocr import (
+            UnlimitedOCRProcessor,
+        )
+    except ImportError:
+        return False
+
+    orig_page_prompt = getattr(UnlimitedOCRProcessor, "page_prompt", None)
+    if orig_page_prompt is None or getattr(
+        orig_page_prompt, "_omlx_page_prompt_compat", False
+    ):
+        return False
+
+    def patched_page_prompt(self, prompt: str, num_images: int) -> str:
+        if (
+            getattr(self, "page_layout", False)
+            and num_images
+            and isinstance(prompt, str)
+            and "<PAGE>" in prompt
+        ):
+            prompt = _repair_unlimited_ocr_page_prompt(
+                prompt, self.image_token, num_images
+            )
+        return orig_page_prompt(self, prompt, num_images)
+
+    patched_page_prompt._omlx_page_prompt_compat = True
+    patched_page_prompt._omlx_original = orig_page_prompt
+    UnlimitedOCRProcessor.page_prompt = patched_page_prompt
+    return True
+
+
+def _repair_unlimited_ocr_page_prompt(
+    text: str, image_token: str, num_images: int
+) -> str:
+    """Keep ``<PAGE>`` directly before ``<image>`` in Unlimited-OCR-2 prompts."""
+    page_image = f"<PAGE>{image_token}"
+    if image_token not in text:
+        page_match = _LEADING_PAGE_MARKERS_RE.match(text)
+        if page_match is not None:
+            return page_image * num_images + text[page_match.end() :]
+        return f"{image_token}{text}"
+    if "<PAGE>" in text:
+        inv_pattern = (
+            _INVERTED_IMAGE_PAGE_RE
+            if image_token == "<image>"
+            else re.compile(rf"^\s*(?:{re.escape(image_token)}\s*)+(?:<PAGE>\s*)+")
+        )
+        inv_match = inv_pattern.match(text)
+        if inv_match is not None:
+            return page_image * num_images + text[inv_match.end() :]
+        return re.sub(rf"<PAGE>\s+{re.escape(image_token)}", page_image, text)
+    return text
+
+
 def is_applied() -> bool:
     return _APPLIED
 
@@ -105,15 +167,12 @@ def _patch_prompt_utils(prompt_utils: Any) -> None:
             content = prompt_utils.extract_text_from_content(prompt)
             # Unlimited-OCR uses a single literal <image> token for one or many
             # pages, matching upstream infer_multi (MessageFormat.SINGLE_IMAGE_TOKEN).
-            # The model card's prompt already starts with <image>; adding a second
-            # one fails the processor's token count check.
-            if (
-                role == "user"
-                and not skip_image_token
-                and num_images > 0
-                and "<image>" not in content
-            ):
-                content = f"<image>{content}"
+            # When the caller supplies leading <PAGE> markers (Unlimited-OCR-2),
+            # preserve <PAGE><image> order rather than inverting to <image><PAGE>.
+            if role == "user" and not skip_image_token and num_images > 0:
+                content = _repair_unlimited_ocr_page_prompt(
+                    content, "<image>", num_images
+                )
             return {"role": role, "content": content}
         return original(
             model_name,
@@ -142,4 +201,5 @@ __all__ = [
     "apply_mlx_vlm_unlimited_ocr_compat_patch",
     "is_applied",
     "_patch_processor_chat_template",
+    "_patch_processor_page_prompt",
 ]

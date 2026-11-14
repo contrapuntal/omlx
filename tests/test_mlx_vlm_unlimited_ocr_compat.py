@@ -200,3 +200,80 @@ def test_unlimited_ocr_chat_template_noop_when_upstream_fix_present(monkeypatch)
         UnlimitedOCRProcessor.__dict__["default_chat_template"] is upstream_descriptor
     )
 
+
+def test_unlimited_ocr_page_prefix_parts_keep_page_before_image():
+    from omlx.patches.mlx_vlm_unlimited_ocr_compat import (
+        apply_mlx_vlm_unlimited_ocr_compat_patch,
+    )
+
+    apply_mlx_vlm_unlimited_ocr_compat_patch()
+
+    from mlx_vlm.prompt_utils import get_message_json
+
+    # Single-page request carrying an explicit <PAGE> prefix before image_url.
+    single_parts = [
+        {"type": "text", "text": "<PAGE>"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        {"type": "text", "text": "Multi page parsing."},
+    ]
+    assert get_message_json("unlimited-ocr", single_parts, num_images=1) == {
+        "role": "user",
+        "content": "<PAGE><image>Multi page parsing.",
+    }
+
+    # Multi-page request carrying two <PAGE> text parts.
+    multi_parts = [
+        {"type": "text", "text": "<PAGE>"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        {"type": "text", "text": "<PAGE>"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,BBBB"}},
+        {"type": "text", "text": "Multi page parsing."},
+    ]
+    assert get_message_json("unlimited-ocr", multi_parts, num_images=2) == {
+        "role": "user",
+        "content": "<PAGE><image><PAGE><image>Multi page parsing.",
+    }
+
+    # Inverted literal "<image><PAGE> ..." is repaired to "<PAGE><image>...".
+    assert get_message_json(
+        "unlimited-ocr", "<image><PAGE> Multi page parsing.", num_images=1
+    ) == {"role": "user", "content": "<PAGE><image>Multi page parsing."}
+
+    # Already-valid layout stays unchanged.
+    assert get_message_json(
+        "unlimited-ocr", "<PAGE><image>Multi page parsing.", num_images=1
+    ) == {"role": "user", "content": "<PAGE><image>Multi page parsing."}
+
+
+def test_unlimited_ocr_processor_page_prompt_repairs_inverted_image_page():
+    from omlx.patches.mlx_vlm_unlimited_ocr_compat import (
+        _patch_processor_page_prompt,
+        apply_mlx_vlm_unlimited_ocr_compat_patch,
+    )
+    from mlx_vlm.models.unlimited_ocr.processing_unlimitedocr import (
+        UnlimitedOCRProcessor,
+    )
+    from transformers import PreTrainedTokenizerFast
+
+    apply_mlx_vlm_unlimited_ocr_compat_patch()
+    assert not _patch_processor_page_prompt()
+
+    tok = PreTrainedTokenizerFast.from_pretrained(
+        "/Volumes/MacExternalStorage/models/ocr/Unlimited-OCR-2-oQ8"
+    )
+    proc = UnlimitedOCRProcessor(tokenizer=tok, page_layout=True)
+
+    assert (
+        proc.page_prompt("<image><PAGE> Multi page parsing.", 1)
+        == "<PAGE><image>Multi page parsing."
+    )
+    assert (
+        proc.page_prompt("<PAGE> <image>Multi page parsing.", 1)
+        == "<PAGE><image>Multi page parsing."
+    )
+    assert (
+        proc.page_prompt("<PAGE><image>Multi page parsing.", 1)
+        == "<PAGE><image>Multi page parsing."
+    )
+
+
