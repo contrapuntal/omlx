@@ -8398,6 +8398,7 @@ _EMBEDDING_GEMMA2_LAYER_STATE_KIND = "embedding_gemma2"
 _FLINT_LAYER_STATE_KIND = "flint"
 _DEEPSEEK_V4_LAYER_STATE_KIND = "deepseek_v4"
 _KIMI_K3_LAYER_STATE_KIND = "kimi_k3"
+_UNLIMITED_OCR_DASH_LAYER_STATE_KIND = "unlimited_ocr_dash"
 _LLAMA4_SCALED_LAYER_STATE_KIND = "llama4_attn_scale"
 
 
@@ -8674,8 +8675,42 @@ def _commit_layer_forward_aux(state, layer_idx: int, aux, fallback=None) -> None
         state["blocks"] = aux
 
 
+def _forward_dash_layer_result(block, inputs, info, layer_idx=None):
+    """Forward a DASH decoder layer with a fresh prompt cache per evaluation.
+
+    DASH attention is batch-1 only and stateful (caches append KV and index
+    keys), so every calibration row gets fresh caches started from its own
+    token ids. The float and quantized passes each build their own caches,
+    keeping the comparison prefill-faithful.
+    """
+    from mlx_vlm.models.unlimited_ocr.dash import build_context, make_dash_cache
+
+    params, rope = info["params"], info["rope"]
+    calib_ids = np.asarray(info["calib_ids"])
+    length = int(inputs.shape[1])
+    outs = []
+    for i in range(inputs.shape[0]):
+        caches = make_dash_cache(params, 1)
+        cache = caches[0]
+        cache.dash_state.start(calib_ids[i])
+        ctx = build_context(cache.dash_state, rope, None, 0, length, inputs.dtype)
+        try:
+            outs.append(block(inputs[i : i + 1], ctx, cache))
+        except (TypeError, ValueError, RuntimeError, AttributeError) as e:
+            suffix = f" at layer {layer_idx}" if layer_idx is not None else ""
+            raise RuntimeError(
+                f"Unlimited-OCR-2 calibration forward failed{suffix}: {e}"
+            ) from e
+    return mx.concatenate(outs, axis=0), None
+
+
 def _forward_layer_result(block, inputs, mask, position_ids, layer_idx=None):
     """Forward pass through a transformer layer, returning output and aux."""
+    if (
+        isinstance(position_ids, dict)
+        and position_ids.get("kind") == _UNLIMITED_OCR_DASH_LAYER_STATE_KIND
+    ):
+        return _forward_dash_layer_result(block, inputs, position_ids, layer_idx)
     if (
         isinstance(position_ids, dict)
         and position_ids.get("kind") == _FLINT_LAYER_STATE_KIND
@@ -9130,6 +9165,25 @@ def _prepare_layer_inputs(model, layers, calib_data, inputs, *, noncausal=False)
         # generic signature probe only lands on ``(inputs,)`` after four
         # caught exceptions per layer.
         return inputs, [None] * len(layers), {"kind": "inkling"}
+    dash_language_model = getattr(model, "language_model", None)
+    dash_params = getattr(dash_language_model, "dash_params", None)
+    if dash_params is not None:
+        # Unlimited-OCR-2 (DASH decoder): per-layer forwards need a prompt
+        # cache started from the row's token ids (see
+        # _forward_dash_layer_result). Skip the native first-layer probe:
+        # the model forward requires caches the probe cannot supply.
+        dash_core = getattr(dash_language_model, "model", None)
+        dash_rope = getattr(dash_core, "_rope", None)
+        if dash_rope is None:
+            raise RuntimeError(
+                "Unlimited-OCR-2 calibration requires the DASH rope table"
+            )
+        return inputs, [None] * len(layers), {
+            "kind": _UNLIMITED_OCR_DASH_LAYER_STATE_KIND,
+            "params": dash_params,
+            "rope": dash_rope,
+            "calib_ids": calib_data,
+        }
     text_model = _find_layer_model(model, layers)
     if text_model is not None:
         inputs = _native_first_layer_input(text_model, layers, calib_data, inputs)
@@ -11079,9 +11133,7 @@ def _collect_imatrix(
                 trust_remote_code=trust_remote_code,
                 strict=False,
             )
-            from mlx_lm.tokenizer_utils import load as load_tokenizer
-
-            tokenizer = load_tokenizer(Path(model_path))
+            tokenizer = _load_sensitivity_tokenizer(model_path)
         else:
             from omlx.utils.model_loading import lm_load_compat as lm_load
 
@@ -11229,9 +11281,7 @@ def _load_or_collect_imatrix(
         # The streaming collector reads the source checkpoint directly with
         # one decoder layer resident at a time, so the RAM-safe proxy
         # indirection below does not apply: it calibrates the real weights.
-        from mlx_lm.tokenizer_utils import load as load_tokenizer
-
-        tokenizer = load_tokenizer(Path(model_path))
+        tokenizer = _load_sensitivity_tokenizer(model_path)
         entries, collection_metadata = _collect_imatrix_streaming(
             model_path,
             tokenizer,
@@ -11300,6 +11350,48 @@ def _load_or_collect_imatrix(
         path=str(path),
         reused=False,
     )
+
+
+class _DirectFileTokenizer:
+    """Minimal encode-only tokenizer built straight from tokenizer.json.
+
+    Calibration only encodes text, so when mlx-lm's loader cannot resolve a
+    checkpoint (e.g. transformers AutoConfig requires remote code for the
+    model type and its generic fallback crashes rope standardization, as
+    with baidu/Unlimited-OCR-2), raw encoding is sufficient and exact.
+    """
+
+    def __init__(self, tokenizer_file: str):
+        from tokenizers import Tokenizer as _HFTokenizer
+
+        self._tok = _HFTokenizer.from_file(tokenizer_file)
+
+    def encode(self, text, **kwargs):
+        return self._tok.encode(text).ids
+
+
+def _load_sensitivity_tokenizer(source) -> Any:
+    """Load a tokenizer for calibration, tolerating unloadable configs.
+
+    Tries mlx-lm's loader first (full wrapper); on failure falls back to
+    encoding directly from the checkpoint's tokenizer.json. Re-raises the
+    original error when no tokenizer.json exists either.
+    """
+    from mlx_lm.tokenizer_utils import load as _mlx_lm_load_tokenizer
+
+    source = Path(source)
+    try:
+        return _mlx_lm_load_tokenizer(source)
+    except Exception as e:
+        logger.warning(
+            "mlx-lm tokenizer load failed (%s); falling back to "
+            "tokenizer.json direct encoding for calibration",
+            e,
+        )
+    tok_file = source / "tokenizer.json"
+    if not tok_file.exists():
+        raise
+    return _DirectFileTokenizer(str(tok_file))
 
 
 def _measure_sensitivity_from_model(
@@ -11482,9 +11574,7 @@ def _measure_sensitivity(
                 trust_remote_code=trust_remote_code,
                 strict=False,
             )
-            from mlx_lm.tokenizer_utils import load as load_tokenizer
-
-            tokenizer = load_tokenizer(Path(model_path))
+            tokenizer = _load_sensitivity_tokenizer(model_path)
         else:
             from omlx.utils.model_loading import lm_load_compat as lm_load
 
@@ -11541,9 +11631,7 @@ def _measure_sensitivity_streaming(
     _measure_sensitivity_from_model.
     """
     source = Path(model_path)
-    from mlx_lm.tokenizer_utils import load as load_tokenizer
-
-    tokenizer = load_tokenizer(source)
+    tokenizer = _load_sensitivity_tokenizer(source)
     if _stream_source_model_type(config) == "qwen4_exp":
         _qwen4_exp_apply_compat_patch()
     embed_weight = _streamed_embed_weight(source, config)
@@ -11952,7 +12040,6 @@ def _measure_sensitivity_from_quantized_model(
                         f"mlx-vlm MTP runtime patch skipped for proxy sensitivity: {e}"
                     )
 
-            from mlx_lm.tokenizer_utils import load as load_tokenizer
             from mlx_vlm.utils import load_model as vlm_load_model
 
             model = vlm_load_model(
@@ -11965,7 +12052,7 @@ def _measure_sensitivity_from_quantized_model(
                 # Match the imatrix and non-proxy sensitivity load paths.
                 strict=False,
             )
-            tokenizer = load_tokenizer(Path(model_path))
+            tokenizer = _load_sensitivity_tokenizer(model_path)
         else:
             # Mirror the main quantize path's MTP patch sequence so an
             # MTP-bearing quantized proxy (e.g. a Qwen3.5 LLM oQ output with
