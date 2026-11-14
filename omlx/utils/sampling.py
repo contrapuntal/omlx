@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import functools
 import math
-from typing import Callable, List, Optional, Sequence
+from typing import Any, Callable, List, Optional, Sequence
 
 import mlx.core as mx
 import numpy as np
@@ -191,6 +191,127 @@ def make_no_repeat_ngram_processor(
         return mx.where(banned[:vocab], -mx.inf, logits)
 
     return no_repeat_ngram_processor
+
+
+_HTML_ROW_TEMPLATES = (
+    "<tr><td></td></tr>",
+    " <tr>\n  <td></td>\n </tr>\n",
+    "<tr>\n<td></td>\n</tr>\n",
+)
+
+
+def _encode_no_special(tokenizer: Any, text: str) -> Optional[list[int]]:
+    encode = getattr(tokenizer, "encode", None)
+    if not callable(encode):
+        return None
+    try:
+        ids = encode(text, add_special_tokens=False)
+    except TypeError:
+        try:
+            ids = encode(text)
+        except Exception:
+            return None
+    except Exception:
+        return None
+    if not isinstance(ids, (list, tuple)) or not ids:
+        return None
+    if not all(isinstance(tok, int) and not isinstance(tok, bool) for tok in ids):
+        return None
+    return list(ids)
+
+
+def _extract_html_row_transitions(
+    tokenizer: Any,
+) -> Optional[tuple[list[list[int]], list[int]]]:
+    """Return ``(row_ends, row_opens)`` token patterns for repeated HTML ``<tr>`` rows."""
+    if tokenizer is None:
+        return None
+    row_ends: list[list[int]] = []
+    row_opens: list[int] = []
+    for tmpl in _HTML_ROW_TEMPLATES:
+        ids2 = _encode_no_special(tokenizer, tmpl * 2)
+        ids3 = _encode_no_special(tokenizer, tmpl * 3)
+        if ids2 is None or ids3 is None or len(ids2) < 6 or len(ids3) <= len(ids2):
+            continue
+        # If the boundary between rows merges (e.g. '</tr><tr>' -> '><'),
+        # ids2 and ids3 diverge at the end of row 2; otherwise at len(ids2).
+        diff_idx = next(
+            (i for i in range(len(ids2)) if ids2[i] != ids3[i]),
+            len(ids2),
+        )
+        if diff_idx < 3 or diff_idx >= len(ids3):
+            continue
+        end_seq = ids3[diff_idx - 3 : diff_idx]
+        open_tok = ids3[diff_idx]
+        if end_seq not in row_ends:
+            row_ends.append(end_seq)
+        if open_tok not in row_opens:
+            row_opens.append(open_tok)
+    if not row_ends or not row_opens:
+        return None
+    return row_ends, row_opens
+
+
+def make_html_row_loop_processor(
+    tokenizer: Any,
+    max_repeated_rows: int = 20,
+    p_min: int = 4,
+    p_max: int = 64,
+) -> Optional[Callable[[mx.array, mx.array], mx.array]]:
+    """Ban re-opening a new ``<tr>`` after ``max_repeated_rows`` identical HTML table rows.
+
+    Uses lazy MLX array ops only so the decode step never synchronizes with the host.
+    Returns ``None`` when ``tokenizer`` does not encode standard HTML table rows.
+    """
+    if max_repeated_rows < 2 or p_min < 3 or p_max < p_min:
+        return None
+    transitions = _extract_html_row_transitions(tokenizer)
+    if transitions is None:
+        return None
+    row_ends_list, row_opens_list = transitions
+    row_ends = mx.array(row_ends_list, dtype=mx.int32)  # (K, 3)
+    row_opens = mx.array(row_opens_list, dtype=mx.int32)  # (M,)
+    num_p = p_max - p_min + 1
+    max_check_len = (max_repeated_rows - 1) * p_max
+    max_window = max_repeated_rows * p_max
+    p_range = mx.arange(p_min, p_max + 1)[:, None]  # (num_p, 1)
+    j_range = mx.arange(max_check_len)[None, :]  # (1, max_check_len)
+    valid_mask = j_range < (max_repeated_rows - 1) * p_range  # (num_p, max_check_len)
+    min_tokens = max_repeated_rows * p_min
+
+    def html_row_loop_processor(tokens: mx.array, logits: mx.array) -> mx.array:
+        n = len(tokens)
+        if n < min_tokens:
+            return logits
+        # 1. Check if the last 3 tokens match a completed </tr> boundary.
+        at_row_end = (row_ends == tokens[-3:].astype(mx.int32)).all(axis=1).any()
+        # 2. Reverse the recent tail so index 0 is tokens[-1].
+        tail = tokens[-max_window:].astype(mx.int32)
+        tail_len = len(tail)
+        if tail_len < max_window:
+            tail = mx.pad(tail, [(max_window - tail_len, 0)], constant_values=-1)
+        r = mx.contiguous(tail[::-1])
+        # 3. For each period P in [p_min, p_max], check r[:(R-1)*P] == r[P:R*P].
+        base = r[:max_check_len][None, :]
+        shifted = mx.as_strided(r[p_min:], (num_p, max_check_len), (1, 1))
+        len_ok = (max_repeated_rows * p_range[:, 0]) <= n
+        matches = (
+            mx.where(valid_mask, (base == shifted) & (base >= 0), True).all(axis=1)
+            & len_ok
+        )
+        # 4. Candidate next token for period P is tokens[-P] == r[P - 1].
+        candidates = r[p_min - 1 : p_max]
+        is_open = (candidates[:, None] == row_opens[None, :]).any(axis=1)
+        should_ban = matches & at_row_end & is_open
+        vocab = logits.shape[-1]
+        target = mx.where(
+            should_ban & (candidates < vocab) & (candidates >= 0), candidates, vocab
+        )
+        banned = mx.zeros((vocab + 1,), dtype=mx.bool_)
+        banned[target] = True
+        return mx.where(banned[:vocab], -mx.inf, logits)
+
+    return html_row_loop_processor
 
 
 def categorical_sampling(logits: mx.array, temp: float) -> mx.array:

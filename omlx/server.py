@@ -2105,12 +2105,34 @@ def _resolve_gpu_power_limit(request, model_id: str | None) -> int | None:
     return min(limits) if limits else None
 
 
-def _no_repeat_ngram_kwargs(request) -> dict[str, int]:
+def _resolve_repetition_context_size(
+    request, model_id: str | None = None
+) -> int | None:
+    val = getattr(request, "repetition_context_size", None)
+    if val is not None:
+        return val
+    ms = get_model_settings_for_request(
+        model_id or getattr(request, "model", None)
+    )
+    if ms is not None:
+        return getattr(ms, "repetition_context_size", None)
+    return None
+
+
+def _no_repeat_ngram_kwargs(
+    request, model_id: str | None = None
+) -> dict[str, int]:
+    target_model = model_id or getattr(request, "model", None)
+    ms = get_model_settings_for_request(target_model) if target_model else None
     size = getattr(request, "no_repeat_ngram_size", None)
+    if size is None and ms is not None:
+        size = getattr(ms, "no_repeat_ngram_size", None)
     if not size:
         return {}
-    window = getattr(request, "ngram_window", None) or 0
-    return {"no_repeat_ngram_size": size, "ngram_window": window}
+    window = getattr(request, "ngram_window", None)
+    if window is None and ms is not None:
+        window = getattr(ms, "ngram_window", None)
+    return {"no_repeat_ngram_size": size, "ngram_window": window or 0}
 
 
 def _ignore_eos_kwargs(request) -> dict[str, bool]:
@@ -4739,14 +4761,13 @@ async def create_completion(
             # A list prompt runs one engine request per prompt, so no single id.
             if len(prompts) == 1:
                 gen_kwargs["_request_id"] = inference_request_id
-            # Widen the repetition-penalty look-back window when the client
-            # asks for it (mlx-lm default window is 20 tokens).
-            repetition_context_size = getattr(
-                request, "repetition_context_size", None
+            # Widen the repetition-penalty look-back window when requested or configured.
+            repetition_context_size = _resolve_repetition_context_size(
+                request, request.model
             )
             if repetition_context_size is not None:
                 gen_kwargs["repetition_context_size"] = repetition_context_size
-            gen_kwargs.update(_no_repeat_ngram_kwargs(request))
+            gen_kwargs.update(_no_repeat_ngram_kwargs(request, model_id=request.model))
             gen_kwargs.update(_ignore_eos_kwargs(request))
             gen_kwargs.update(_cache_store_kwargs(http_request))
 
@@ -5260,14 +5281,13 @@ async def create_chat_completion(
         if images_config is not None:
             chat_kwargs["images_config"] = images_config
 
-        # Widen the repetition-penalty look-back window when the client
-        # asks for it (mlx-lm default window is 20 tokens).
-        repetition_context_size = getattr(
-            request, "repetition_context_size", None
+        # Widen the repetition-penalty look-back window when requested or configured.
+        repetition_context_size = _resolve_repetition_context_size(
+            request, request.model
         )
         if repetition_context_size is not None:
             chat_kwargs["repetition_context_size"] = repetition_context_size
-        chat_kwargs.update(_no_repeat_ngram_kwargs(request))
+        chat_kwargs.update(_no_repeat_ngram_kwargs(request, model_id=request.model))
         chat_kwargs.update(_ignore_eos_kwargs(request))
         chat_kwargs.update(_cache_store_kwargs(http_request))
 
@@ -6166,14 +6186,13 @@ async def stream_completion(
     if request.return_progress:
         # The engine keys the prefill tracker by this id.
         progress_request_id = gen_kwargs.setdefault("_request_id", str(uuid.uuid4()))
-    # Widen the repetition-penalty look-back window when the client
-    # asks for it (mlx-lm default window is 20 tokens).
-    repetition_context_size = getattr(
-        request, "repetition_context_size", None
+    # Widen the repetition-penalty look-back window when requested or configured.
+    repetition_context_size = _resolve_repetition_context_size(
+        request, request.model
     )
     if repetition_context_size is not None:
         gen_kwargs["repetition_context_size"] = repetition_context_size
-    gen_kwargs.update(_no_repeat_ngram_kwargs(request))
+    gen_kwargs.update(_no_repeat_ngram_kwargs(request, model_id=request.model))
     gen_kwargs.update(_ignore_eos_kwargs(request))
     if skip_cache_store:
         gen_kwargs["skip_cache_store"] = True
@@ -8117,10 +8136,9 @@ async def create_anthropic_message(
             "xtc_threshold": xtc_threshold,
         }
 
-        # Widen the repetition-penalty look-back window when the client
-        # asks for it (mlx-lm default window is 20 tokens).
-        repetition_context_size = getattr(
-            request, "repetition_context_size", None
+        # Widen the repetition-penalty look-back window when requested or configured.
+        repetition_context_size = _resolve_repetition_context_size(
+            request, request.model
         )
         if repetition_context_size is not None:
             chat_kwargs["repetition_context_size"] = repetition_context_size
@@ -8866,10 +8884,9 @@ async def create_response(
             "xtc_threshold": xtc_threshold,
         }
 
-        # Widen the repetition-penalty look-back window when the client
-        # asks for it (mlx-lm default window is 20 tokens).
-        repetition_context_size = getattr(
-            request, "repetition_context_size", None
+        # Widen the repetition-penalty look-back window when requested or configured.
+        repetition_context_size = _resolve_repetition_context_size(
+            request, request.model
         )
         if repetition_context_size is not None:
             chat_kwargs["repetition_context_size"] = repetition_context_size

@@ -122,7 +122,11 @@ from .utils.metal_sync import (
     unreleased_graphics_bytes,
 )
 from .utils.proc_memory import get_graphics_footprint, get_phys_footprint
-from .utils.sampling import make_no_repeat_ngram_processor, select_logprobs
+from .utils.sampling import (
+    make_html_row_loop_processor,
+    make_no_repeat_ngram_processor,
+    select_logprobs,
+)
 from .utils.sampling import make_sampler as omlx_make_sampler
 from .utils.sampling import make_shared_sampler as omlx_make_shared_sampler
 from .utils.tokenizer import create_streaming_detokenizer
@@ -221,6 +225,49 @@ def _make_suppressing_sampler(
         return sampler(_apply_suppress_token_ids(logits, suppress_tuple))
 
     return _sample
+
+
+def _build_penalty_logits_processors(sampling_params: SamplingParams) -> list[Callable]:
+    """Build repetition/presence/frequency logits processors with shared context size."""
+    repetition_penalty = (
+        sampling_params.repetition_penalty
+        if sampling_params.repetition_penalty != 1.0
+        else None
+    )
+    presence_penalty = (
+        sampling_params.presence_penalty
+        if sampling_params.presence_penalty != 0.0
+        else None
+    )
+    frequency_penalty = (
+        sampling_params.frequency_penalty
+        if sampling_params.frequency_penalty != 0.0
+        else None
+    )
+    context_size = sampling_params.repetition_context_size
+    context_size_kwargs = (
+        {
+            "repetition_context_size": context_size,
+            "presence_context_size": context_size,
+            "frequency_context_size": context_size,
+        }
+        if context_size is not None
+        else {}
+    )
+    try:
+        return make_logits_processors(
+            repetition_penalty=repetition_penalty,
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
+            **context_size_kwargs,
+        )
+    except TypeError:
+        return make_logits_processors(
+            repetition_penalty=repetition_penalty,
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
+            **({"repetition_context_size": context_size} if context_size is not None else {}),
+        )
 
 
 @dataclass
@@ -3812,28 +3859,7 @@ class Scheduler:
         )
 
         # Create logits processors for repetition/presence/frequency penalties
-        logits_processors = make_logits_processors(
-            repetition_penalty=(
-                sampling_params.repetition_penalty
-                if sampling_params.repetition_penalty != 1.0
-                else None
-            ),
-            presence_penalty=(
-                sampling_params.presence_penalty
-                if sampling_params.presence_penalty != 0.0
-                else None
-            ),
-            frequency_penalty=(
-                sampling_params.frequency_penalty
-                if sampling_params.frequency_penalty != 0.0
-                else None
-            ),
-            **(
-                {"repetition_context_size": sampling_params.repetition_context_size}
-                if sampling_params.repetition_context_size is not None
-                else {}
-            ),
-        )
+        logits_processors = _build_penalty_logits_processors(sampling_params)
 
         suppress_processor = _make_suppress_logits_processor(
             self._model_suppress_tokens
@@ -8613,28 +8639,7 @@ class Scheduler:
             xtc_threshold=sampling_params.xtc_threshold,
             xtc_special_tokens=self._xtc_special_tokens,
         )
-        logits_processors = make_logits_processors(
-            repetition_penalty=(
-                sampling_params.repetition_penalty
-                if sampling_params.repetition_penalty != 1.0
-                else None
-            ),
-            presence_penalty=(
-                sampling_params.presence_penalty
-                if sampling_params.presence_penalty != 0.0
-                else None
-            ),
-            frequency_penalty=(
-                sampling_params.frequency_penalty
-                if sampling_params.frequency_penalty != 0.0
-                else None
-            ),
-            **(
-                {"repetition_context_size": sampling_params.repetition_context_size}
-                if sampling_params.repetition_context_size is not None
-                else {}
-            ),
-        )
+        logits_processors = _build_penalty_logits_processors(sampling_params)
         if sampling_params.no_repeat_ngram_size:
             logits_processors.append(
                 make_no_repeat_ngram_processor(
@@ -8642,6 +8647,19 @@ class Scheduler:
                     sampling_params.ngram_window,
                 )
             )
+        if (
+            sampling_params.repetition_penalty != 1.0
+            or sampling_params.presence_penalty != 0.0
+            or sampling_params.frequency_penalty != 0.0
+        ):
+            tok = getattr(self, "tokenizer", None)
+            if tok is not None:
+                cached_tok_id = getattr(self, "_html_row_loop_tok_id", None)
+                if cached_tok_id != id(tok):
+                    self._html_row_loop_processor = make_html_row_loop_processor(tok)
+                    self._html_row_loop_tok_id = id(tok)
+                if self._html_row_loop_processor is not None:
+                    logits_processors.append(self._html_row_loop_processor)
 
         suppress_processor = _make_suppress_logits_processor(
             self._model_suppress_tokens
