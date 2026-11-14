@@ -33,6 +33,6 @@ def test_audio_extra_uses_immutable_companion_fork_pin():
     audio = data["project"]["optional-dependencies"]["audio"]
     pin = next(req for req in audio if req.startswith("mlx-audio["))
     assert re.fullmatch(
-        r"mlx-audio\[tts,stt,sts\] @ git\+https://github\.com/(Blaizzy|contrapuntal)/mlx-audio@[0-9a-f]{40}",
+        r"mlx-audio\[tts,stt,sts\] @ git\+https://github\.com/(Neywa-Labs|Blaizzy|contrapuntal)/mlx-audio@[0-9a-f]{40}",
         pin,
     )
