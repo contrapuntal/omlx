@@ -91,12 +91,12 @@ def apply_mlx_vlm_teleocr_compat_patch() -> bool:
             return True
 
         @wraps(original)
-        def get_model_and_args(config):
+        def get_model_and_args(config, model_path=None):
             if is_teleocr_config(config):
                 from . import model
 
                 return model, "qwen2_5_vl"
-            return original(config)
+            return original(config, model_path)
 
         get_model_and_args._omlx_teleocr_compat = True
         utils.get_model_and_args = get_model_and_args

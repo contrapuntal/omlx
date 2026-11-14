@@ -661,14 +661,20 @@ def test_persisted_legacy_entries_release_real_references_after_restart(
         append(native, [token])
     if legacy_layout == "plain-kv":
         old = KVCache()
-        old.state = native.state
+        # mlx-lm state is (keys, values, offset) since #1778; the ring's
+        # native state is still the (keys, values) pair.
+        keys, values = native.state
+        old.state = (keys, values, native.offset)
     else:
         old = native
         assert old.meta_state == ("2", "4", "12", "0")
     payload = [
         {
             "state": old.state,
-            "meta_state": old.meta_state,
+            # New-pin mlx_lm KVCache carries no meta_state attribute
+            # (metadata lives in `state` since #1778); legacy plain-KV
+            # entries persist with empty metadata.
+            "meta_state": getattr(old, "meta_state", ()),
             "class_name": type(old).__name__,
             "cache_type": "KVCache",
         }

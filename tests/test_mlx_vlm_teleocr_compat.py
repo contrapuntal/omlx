@@ -12,13 +12,9 @@ from mlx_vlm.models.cache import KVCache
 
 
 def adapter():
-    from omlx.patches.mlx_vlm_mlx0322_compat import (
-        apply_mlx_vlm_mlx0322_compat_patch,
-    )
-
-    # Match oMLX pre-load ordering: inherited vision methods must be imported
-    # after the MLX scalar-argument compatibility hook is installed.
-    apply_mlx_vlm_mlx0322_compat_patch()
+    # The MLX scalar-argument compatibility hook (mlx_vlm_mlx0322_compat) was
+    # removed upstream in #3719: mlx-vlm 66e68ce carries those fixes natively,
+    # so there is nothing to install before importing the TeleOCR adapter.
     return importlib.import_module("omlx.patches.mlx_vlm_teleocr_compat")
 
 

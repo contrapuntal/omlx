@@ -4979,7 +4979,7 @@ class TestEnginePoolInUseLease:
         assert entry.in_use == 0
         assert entry.pending_unload_reason is None
         assert entry.abort_requested is False
-        pool._unload_engine.assert_awaited_once_with("leased")
+        pool._unload_engine.assert_awaited_once_with("leased", force=False)
 
     @pytest.mark.asyncio
     async def test_release_engine_keeps_pending_while_scheduler_active(self):
@@ -5047,7 +5047,7 @@ class TestEnginePoolInUseLease:
         task = pool._pending_unload_tasks["leased"]
         await asyncio.wait_for(task, timeout=1)
 
-        pool._unload_engine.assert_awaited_once_with("leased")
+        pool._unload_engine.assert_awaited_once_with("leased", force=False)
         assert entry.pending_unload_reason is None
         assert entry.pending_unload_allow_pinned is False
         assert entry.abort_requested is False
@@ -5063,7 +5063,7 @@ class TestEnginePoolInUseLease:
         unloaded = await pool.request_unload("idle")
 
         assert unloaded is True
-        pool._unload_engine.assert_awaited_once_with("idle")
+        pool._unload_engine.assert_awaited_once_with("idle", force=False)
         assert entry.engine.abort_all_requests.await_count == 0
 
     @pytest.mark.asyncio
@@ -5089,7 +5089,7 @@ class TestEnginePoolInUseLease:
         pending = pool._pending_unload_tasks["leased"]
         await pool.release_engine("leased")
 
-        pool._unload_engine.assert_awaited_once_with("leased")
+        pool._unload_engine.assert_awaited_once_with("leased", force=False)
         await asyncio.wait_for(pending, timeout=1)
 
     @pytest.mark.asyncio
@@ -5720,7 +5720,7 @@ async def test_rejected_cluster_reload_preserves_pending_unload():
             await pool.get_engine("leased")
 
         await pool.release_engine("leased")
-        pool._unload_engine.assert_awaited_once_with("leased")
+        pool._unload_engine.assert_awaited_once_with("leased", force=False)
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)

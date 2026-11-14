@@ -260,6 +260,11 @@ class TestPreflightAndDiffusionValidation:
         engine.is_diffusion_model = False
         engine.model_type = "qwen2_vl"
         engine.preflight_chat = VLMBatchedEngine.preflight_chat.__get__(engine)
+        # New-tree preflight extracts media via the engine helper; stub it to
+        # report the single inline image in the test messages.
+        engine._extract_request_media = MagicMock(
+            side_effect=lambda msgs: (msgs, msgs, [object()], [], [])
+        )
 
         messages = [
             {
@@ -558,6 +563,13 @@ class TestVLMEngineInputPreparationAndCacheIsolation:
         engine._vision_cache = None
         engine._vision_cache_enabled = False
         engine._language_prompt_kwargs = MagicMock(return_value={})
+        # Bypass the cached-vision fast path: these tests exercise the
+        # prepare_inputs branch (image-mode kwarg forwarding + cache keys).
+        engine._try_build_cached_vision_inputs = MagicMock(return_value=None)
+        # Report a full per-image miss so the tests exercise the compute-all
+        # path. (An unstubbed spec mock would be truthy and look like a
+        # partial hit, skipping feature computation entirely.)
+        engine._encode_missing_vision_features = MagicMock(return_value=None)
 
         dummy_embeds = MagicMock()
         dummy_embeds.inputs_embeds = MagicMock()
@@ -570,8 +582,13 @@ class TestVLMEngineInputPreparationAndCacheIsolation:
 
     def test_process_chat_messages_pops_and_forwards_images_config(self):
         """_process_chat_messages pops images_config from kwargs and passes to _prepare_vision_inputs."""
+        messages = [{"role": "user", "content": "text only"}]
         engine = MagicMock(spec=VLMBatchedEngine)
+        engine._processor = MagicMock()
         engine._apply_ocr_prompt = MagicMock(side_effect=lambda msgs: msgs)
+        engine._extract_request_media = MagicMock(
+            return_value=(messages, messages, [], [], [])
+        )
         engine._prepare_vision_inputs = MagicMock(
             return_value=([1, 2, 3], None, {}, "imghash", 0, [])
         )
@@ -579,7 +596,6 @@ class TestVLMEngineInputPreparationAndCacheIsolation:
             VLMBatchedEngine._process_chat_messages.__get__(engine)
         )
 
-        messages = [{"role": "user", "content": "text only"}]
         kwargs = {"images_config": {"image_mode": "base"}, "temperature": 0.2}
 
         engine._process_chat_messages(messages, tools=None, kwargs=kwargs)
@@ -744,7 +760,7 @@ class TestVLMEngineInputPreparationAndCacheIsolation:
             def get(self, key, model_name):
                 return mock_cache.get(key)
 
-            def put(self, key, model_name, features):
+            def put(self, key, model_name, features, grid=None):
                 mock_cache[key] = features
 
         mock_vlm_engine._vision_cache = DummyVisionCache()
